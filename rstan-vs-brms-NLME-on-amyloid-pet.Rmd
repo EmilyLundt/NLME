@@ -1,0 +1,1380 @@
+---
+title: "Rstan vs BRMS for fitting a non-linear mixed effect (NLME) model on amyloid PET"
+author: "Emily Lundt"
+date: "`r format(Sys.Date(),'%B %e, %Y')`"
+output: 
+  bookdown::pdf_document2:
+    toc: FALSE
+  bookdown::html_document2:
+    number_sections: TRUE
+    fig_caption: TRUE
+knit: (function(...) rmarkdown::render(..., output_format = 'all') )
+---
+
+# Overview
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, warning=F, message=F,fig.pos='h')
+options(scipen=999)
+```
+
+In 2021, Terry Therneau published the inaugural publication using Rstan to fit
+non-linear mixed effects (NLME) models.  
+See https://pubmed.ncbi.nlm.nih.gov/34333107/. At that time, he was using the name 'AFT model'
+and now we more accurately call them NLME models.
+
+The purpose of this tutorial will be to provide examples of how to fit an NLME model.
+First, using the package `rstan` - the R interface to Stan. 
+Second, with the `brms` package - Bayesian Regression Models using Stan.
+
+The BRMS package provides a simple interface with formula syntax that mimics that
+of the `lme4` package.
+
+We have found that specifying priors as well as initial values has been critical
+to get NLME models to fit in a timely manner.
+    
+I see the benefit of using BRMS for a few reasons:
+
+ 1. BRMS could be used for initial exploration of new, less familiar outcomes prior
+    to including the new outcome in a multivariate model.
+ 2. BRMS has an algorithm "meanfield". It runs quickly. It can be used to get
+    reasonable initial values which can then be passed to a fit using the NUTS algorithm.
+
+All models will be fit using the simulated data provided as part of Terry's 2021 publication.
+https://github.com/therneau/AFTmodel/tree/master/fourmarker
+
+I am curious as to whether there is a way to extend BRMS to fit our multivariate/joint
+NLME models. In my exploration of BRMS, subjects who do not have both outcomes of interest
+were kicked out of the model. Future work could explore whether there is a way around this.
+
+# Setup the data
+
+```{r setup1, warning=F, results='hide', message=F}
+###############################
+## Load packages, functions
+###############################
+library(tidyverse)
+library(rstan)
+library(brms)
+
+## Instead of loading the knitr library, just load this function
+kable <- function(...) knitr::kable(...)
+
+###############################
+## Load simulated data
+###############################
+# URL of the raw file on GitHub
+# Must replace /blob with /raw
+# github_url <- "https://github.com/therneau/AFTmodel/raw/master/fourmarker/simdata.rds"
+ 
+# Local path where you want to save the file
+local_path <- "./simdata.rds"
+ 
+# Download the file from GitHub
+# utils::download.file(url = github_url, destfile = local_path, method="auto", quiet = FALSE)
+
+# Load the downloaded file into R
+simdata <- readRDS(local_path)
+
+###############################
+## Data for these analyses
+###############################
+
+## Keep MCSA subjects with amyloid and having APOE genotyping
+d1 <- filter(simdata, outcome == 'amyloid', apoemiss == 0, adrc == 0)
+
+## Add some useful vars
+d2 <- d1 %>%
+  group_by(id) %>%
+  mutate(age.at.start = first(age),
+         npib = n()) %>%
+  ungroup()
+
+## Limit to the most informative subjects, having serial pib-PETs
+d3 <- filter(d2, npib >= 3)
+
+## this step must come after filtering, as this is a fake ID
+## to be passed to rstan
+d4 <- d3 %>%
+  ## ID variables must be a count from 1, 2, ...
+  mutate(id = as.numeric(factor(id)))
+
+d <- ungroup(d4)
+
+
+###############################
+# Color-blind friendly palette
+###############################
+col.universal <- c(Orange = "#E69F00", `Sky blue` = "#56B4E9", `Bluish green` = "#009E73", 
+                   Yellow = "#F0E442", Blue = "#0072B2", Vermillion = "#D55E00", 
+                   `Reddish purple` = "#CC79A7")
+
+###############################
+## Set up a function to plot trajectories over time
+###############################
+## Make it generic enough to accept
+## different x's and y's
+pfun2 <- function(data, ...) {
+  .d <- mutate(data, color = as.character(factor(id %% 7, 0:6, col.universal)),
+         alpha = ifelse(id %% 2 == 0, 1, 0.7))
+  ggplot(data=.d, ...) +
+    geom_line(aes(group=id, color=color, alpha=alpha)) +
+    theme(legend.position='none') +
+    ## Set color and alpha to value in dataset
+    scale_color_identity() +
+    scale_alpha_identity() +
+    ## Set aspect ratio so each panel is square
+    theme(aspect.ratio = 1)
+}
+
+###############################
+## Set plot defaults
+###############################
+theme_set(theme_bw())
+## update axes, borders to black. not gray
+theme_update(
+  axis.text = element_text(color = "black"),
+  panel.border = element_rect(color = "black"))
+
+###############################
+## Setup for multiple cores
+###############################
+options(digits = 3, mc.cores = 4)
+
+```
+
+The simulated dataset was stacked per-person per-visit per-outcome.  
+
+We have limited to MCSA visits with amyloid PET imaging and APOE genotype. Subjects must have
+3 or more serial amyloid PET scans.
+
+Summarize the data.
+
+```{r, results='asis'}
+summarytools::dfSummary(d, plain.ascii = FALSE, style = "grid", valid.col=F, 
+                        tmp.img.dir = "/tmp")
+```
+
+Plot a sample of amyloid trajectories.
+
+```{r amyloidtrajectories}
+set.seed(102)
+ptlst <- d %>% filter(!duplicated(id)) %>%
+  mutate(agedecade = cut(age.at.start, c(50,60,70,80,90,Inf))) %>%
+  slice_sample(n=10, by=agedecade, weight_by=npib**3) %>% 
+  pull(id)
+
+pdat <- filter(d, id %in% ptlst)
+
+pdat %>%
+  pfun2(., mapping=aes(x=age, y=exp(y))) +
+  geom_point(size=0.2, aes(color=color)) +
+  labs(y='Amyloid PET, SUVR')
+```
+
+
+```{r mike-sanity-check, include=F, eval=F}
+## Mike G had trajectories that look weird/wrong. check it.
+
+## Save then load the data from github
+github_url <- "https://github.com/therneau/AFTmodel/raw/master/fourmarker/simdata.rds"
+local_path <- "./simdata2.rds"
+utils::download.file(url = github_url, destfile = local_path, method="auto", quiet = FALSE)
+simdata2 <- readRDS(local_path)
+
+simdata2 %>%
+  filter(outcome == 'amyloid') %>%
+  ggplot(mapping=aes(x=age, y=exp(y))) +
+    geom_line(aes(group=id)) +
+    theme(legend.position='none') +
+  geom_point(size=0.2) +
+  labs(y='Amyloid PET, SUVR')
+ 
+simdata2 %>%
+  filter(outcome == 'tau') %>%
+  ggplot(mapping=aes(x=age, y=exp(y))) +
+    geom_line(aes(group=id)) +
+    theme(legend.position='none') +
+  geom_point(size=0.2) +
+  labs(y='tau PET, SUVR')
+
+## this data looks fine. unable to replicate
+
+```
+
+# Rstan
+
+First, use Rstan to fit an NLME model on amyloid PET.
+
+Try to use the most recent workflow, and to include all code within this document.
+
+## Format the data as a list for stan
+
+```{r stanlist}
+xvars <- c('male','apoepos','educ')
+
+stan.list <- list(N = nrow(d),                    ## total count obs
+                  M = length(unique(d$id)),       ## total count subjects
+                  P = length(xvars)+1,            ## total count covars plus intercept in Xmat
+                  K = length(unique(d$outcome)),  ## total count outcomes
+                  ## transformations of y-values so that all outcomes
+                  ## have a similar scale will improve the model fit
+                  ## In this case, y is log of amyloid SUVR, so it is
+                  ## already transformed.
+                  y = d$y,
+                  outcome = d$outcome,
+                  ## Age at y, centered and scaled more stable for rstan
+                  age = (d$age-75)/10, 
+                  ## covariate matrix, as.matrix so stan is happy
+                  ## includes intercept
+                  X = as.matrix(cbind(1, d[,xvars])),
+                  id = d$id
+                  )
+```
+
+
+## Get initial values 
+
+In this example, I will use the GLMER approach.
+
+```{r getinitial}
+###############################
+## Compute initial values using logit trick
+###############################
+
+## This analysis framework was based on preliminary work in ../../../../cognition/tmt.
+## Terry applied some of that preliminary work here: ../../tmt/refit.Rmd
+## I will pull some code from that file, and update it for my needs.
+
+## In short, fit a generalized linear mixed effects model with a logit link function to
+## estimate the non-linear shape of the fit.
+
+###############################
+## Load some libraries, define helpful functions
+###############################
+library(lme4)
+library(splines2)
+library(survival)
+
+rescale <- function(y, from=c(.02, .98), to = c(.02, .7)) {
+  # remap the .02,.98 quantiles to 0 and .7
+  qq <- quantile(y, from, na.rm=TRUE)
+  y2 <- to[1] + diff(to)*(y- qq[1])/diff(qq)
+  attr(y2, 'unscale') <- unname(c(qq[1], diff(qq)/diff(to), to[1]))
+  y2
+}
+unscale <- function(y2, par= attr(y2, "unscale")) {
+  y <- par[1] + par[2]*(y2 - par[3])
+  as.vector(y)
+}
+
+###############################
+## Get estimated (scaled) link functions
+###############################
+
+## Limit to subjects having certain amount of follow-up
+
+## Center and scale age
+d$age10c75 <- (d$age-75)/10
+
+## PiB
+bfitp <- glmer(rescale(y) ~ age10c75 + male + apoepos + (1| id),
+               data= d, family = gaussian(link= blogit()))
+
+plot(rescale(y) ~ age, data = d)
+lines(50:100, predict(bfitp, 
+                      data.frame(age10c75 = (50:100-75)/10, male=0, apoepos=0),
+                      re.form=NA, type='response'), col=2)
+
+
+
+###############################
+## Initial random effects (alphas)
+###############################
+## rescale to age coefficient, to convert to 'age in decades'
+initial.random.effects <- ranef(bfitp)[[1]][[1]]/fixef(bfitp)["age10c75"]
+
+summary(initial.random.effects)
+
+
+
+###############################
+## Initial B (shape parameters)
+###############################
+
+## Get predicted y-values from a given set of ages.
+## There is no error, so the shape is obvious.
+## Then we can use optim to get what corresponding 
+## five hyperbola parameters should be.
+## Then we can pass the hyperbola parms to rstan as needed.
+
+# Define the function to minimize (sum of squared differences)
+minimize.hyper <- function(B, x, y) {
+  z <- x + B[4]
+  yhat <-  B[1] + B[2]*z + .5*(B[3]-B[2])*(z + sqrt(z^2 + B[5]^2))
+  sum((y-yhat)^2)
+}
+
+# Define the function to get predicted y-values from the hyperbola
+predict.hyper <- function(B, x){
+  z <- x + B[4]
+  yhat <-  B[1] + B[2]*z + .5*(B[3]-B[2])*(z + sqrt(z^2 + B[5]^2))
+  return(yhat)
+}
+
+## Note: choice of age range impacts optim solution
+dummy2 <- data.frame(age10c75=(55:105-75)/10, male=0, apoepos=0, clinic=9999999)
+
+## Set seed to regenerate same optim solution
+set.seed(142)
+
+## Predicted y-values from the model
+yhat <- predict(bfitp, newdata=dummy2, re.form=NA, type='response', allow.new.levels=T)
+## Undo the scaling Terry applied to constrain the shapes.
+yhat <- unscale(yhat, par=attr(rescale(d$y),'unscale'))
+
+# Use optim to find the minimum of the function
+optim.inits <- rep(0.1, 5)
+fitp <- optim(par=optim.inits, 
+              fn=minimize.hyper, x=dummy2$age10c75, y=yhat, 
+              method="BFGS")
+
+# The optimized parameters
+fitp$par
+
+## Plot to verify it worked
+plot(dummy2$age10c75, yhat)
+lines(dummy2$age10c75, predict.hyper(fitp$par, dummy2$age10c75), col=2)
+
+## Recall
+## B1 = up-down intercept
+## B2 = initial slope
+## B3 = final slope
+## B4 = right-left intercept
+## B5 = softness
+
+## Matrix of initial shape parameters
+(initial.shape.parm <- matrix(fitp$par, ncol=5,nrow=1,
+                             dimnames = list("pib",
+                                     c('B1','B2','B3','B4','B5'))))
+
+
+###############################
+## Initial beta coefs
+###############################
+# In the Rstan model the age effect will not be estimated.
+# Thus must recale GLMER fixed effects relative to the age
+initial.beta <- fixef(bfitp)/fixef(bfitp)['age10c75']
+## Education was not estimated, but prior knowledge indicates the effect is near 0
+(initial.beta <- c(initial.beta[c('(Intercept)','male','apoepos')], 'educ'=0))
+
+```
+
+## Define the stan code to fit the NLME model
+
+
+```{r stanmodelcode}
+## stan model code = smc
+smc2 <- "
+// Stan for a nonlinear mixed effects model
+// hyper2 is monotone increasing 
+
+functions {
+    real hyper2(real b1, real b2, real b3, real b4, real eta) {
+       return(b1 + b2*eta + .5*(b3-b2)*(eta + sqrt(eta^2 + b4^2)));
+    }
+}
+data {
+  int<lower=0> M;  // number of persons (subjects)
+  int<lower=0> N;  // number of observations
+  int P;           // number of covariates plus intercept
+  real y[N];       // observed marker values
+  real age[N];     // age
+  matrix[N, P] X;  // covariates
+  int id[N];       // the id index, 1,2 etc
+}  
+
+parameters {
+   real<lower=0> sigma;   // residual variance
+   vector [P] beta;       // regression coefficients
+   vector [M] alpha;      // random offsets per subject
+   real<lower=0> atau;    // alpha SD
+   real<lower=0> B[4];    // parameters of the hyperbola
+}
+transformed parameters {
+   vector[N] lin;         // linear predictors 
+   vector[N] eta;
+   vector[N] yhat;
+   lin = X*beta;  
+   for (i in 1:N){
+      eta[i] = age[i] + alpha[id[i]] + lin[i];
+      yhat[i] = hyper2(B[1],    // up-down shift
+                       B[2],    // initial slope
+                       B[3],    // final slope
+                       B[4],    // sharpness/smoothness
+                       eta[i]); // left-right shift coef is beta[1,]
+   }
+}
+
+model {
+   atau ~ normal(0,1);
+   sigma ~ normal(0,1);
+   
+   beta ~ normal(0, 5);
+   B ~ normal(0,5);
+
+   for (j in 1:M) {
+     alpha[j] ~ normal(0, atau);
+     }
+   for (i in 1:N) {
+      y[i]  ~ normal(yhat[i], sigma);
+    }
+}
+"
+
+
+```
+
+## Fit the model
+
+```{r rstanfit}
+## Set up to pass initial values
+P <- stan.list$P # number of Xmat variables
+K <- stan.list$K # number of outcomes
+
+## Four Bs
+b2 <- initial.shape.parm[c(1,2,3,5)]
+
+## A function to generate initial values per chain
+## Add a small amount of noise to each value, so chains are
+## not starting at exactly the same place
+init.fun <- function(chain.id=1) {
+  a3 <- initial.random.effects * runif(length(initial.random.effects), 0.95, 1.05)
+  list(
+    beta  = initial.beta * runif(4, 0.95, 1.05)
+    ,alpha = a3
+    ,atau = runif(K, 8,11)/10 ## per decade, same units as age
+    ,sigma = runif(K,0.01,0.2)
+    ,B = b2 * runif(length(b2), 0.95,1.05)
+  )
+}
+
+set.seed(1922)
+n.chains <- 4
+init.ll <- lapply(1:n.chains, function(chain.id) init.fun(chain.id))
+
+## This is very slow
+if(!file.exists("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/stan.fit.rda")){
+stan.fit <- stan(model_code=smc2, 
+                 data=stan.list,
+                 pars = c("B","beta","atau","sigma","alpha"),
+                 iter=2500,
+                 init=init.ll,
+                 thin=1,
+                 seed=1922,
+                 chains=4,
+                 cores=4,
+                 control=list(max_treedepth=15, adapt_delta=0.95)) ## same as rstanarm default
+  ## too big to save out to consult directory. saved to bigdata
+  save(stan.fit, file="/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/stan.fit.rda")
+} else load("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/stan.fit.rda")
+
+
+```
+
+## Check posterior summary statistics and convergence diagnostics
+
+There is good documentation of the diagnostic plots for Rstan here https://mc-stan.org/rstan/articles/index.html
+
+Here are a few things worth checking, but this is certainly not exhaustive.
+
+- runtime
+- Rhat
+- divergent transitions
+- log likelihood per chain
+- random sample of per-subject trajectories per chain
+- mean curves per chain
+
+```{r rstanconvergence, fig.height=2.5}
+
+###############################
+## Verify initial values were used
+## Stan often does not throw a warning if something went wrong and 
+## initial values were not used.
+str(stan.fit@inits[[1]])
+str(init.ll[[1]])
+
+###############################
+## Runtime, in hours
+rowSums(get_elapsed_time(stan.fit))/60/60
+
+###############################
+## Get parameter summaries of stan model (ssm)
+ssm <- summary(stan.fit)
+## List of parameter names
+nms <- rownames(ssm[[1]])
+```
+
+```{r, include=F, eval=F}
+###############################
+## Quick plots to review estimates
+
+## This is useful for amyloid PET because these models are well understood
+## so I have a good feeling for what these values should be.
+## I am not sure these plots will be as useful for an unfamiliar measures?
+plot(stan.fit, pars='B')      ## expect c(0.37, 0.05, 0.33, 0.04)
+plot(stan.fit, pars='beta')   ## expect c(-1, -0.15, 0.4, 0.03)
+plot(stan.fit, pars=grep('^alpha',nms,value=T)[1:10])  ## print the first 10 alphas, btwn -2 to 2 is ok
+plot(stan.fit, pars='sigma')  ## expect between 0.01 and 0.3
+plot(stan.fit, pars='atau')   ## expect between 0.7 and 1.0
+```
+
+
+```{r}
+
+###############################
+## Review Rhat
+
+table(cut(ssm[[1]][,'Rhat'], breaks=c(0.9,1,1.05,1.2,2,100)), useNA='always')
+
+myvars <- c(1,4,8:10)
+
+## best Rhats
+as.data.frame(ssm[[1]]) %>% arrange(Rhat) %>% select(all_of(myvars)) %>% head(20)
+
+## worst Rhats
+as.data.frame(ssm[[1]]) %>% arrange(desc(Rhat)) %>% select(all_of(myvars)) %>% head(20)
+
+```
+
+In a model that has converged, we want all <1.05 for a really good fit.
+I would be OK assessing a model where some of the alphas were >1.05, 
+but for publication all should be <1.05.
+
+```{r, include=F,eval=T}
+
+# - divergent transitions - Possible future work.
+# 
+```
+
+```{r, fig.height=2.5}
+###############################
+# Review log lik per chain
+
+ll <- ssm[[2]]["lp__",c('50%','2.5%','97.5%'),]
+
+round(ll)
+
+t(ll) %>%
+  as.data.frame %>%
+  rownames_to_column(var='chains') %>%
+  ggplot(aes(y=chains, x=`50%`, xmin=`2.5%`, xmax=`97.5%`)) +
+  geom_pointrange(size=1, color='blue', fill='white', shape=22)
+```
+
+The log likelihood is similar in each chain, this supports that all chains have converged
+to the same solution.
+
+```{r}
+###############################
+## To compare the predictions from each chain
+## review a set of curves for each chain
+
+## Have all four chains arrived at the same place?
+## Have the iterations in each chain arrived at the same place?
+
+hyper <- function(B, age) {
+  ## To plot the mean curve, must match the hyper
+  ## as it was called in stan
+  ## So no intercept term is needed
+  z <- (age - 75)/10
+  yhat <-  B[1] + B[2]*z + .5*(B[3]-B[2])*(z + sqrt(z^2 + B[4]^2))
+  return(yhat)
+}
+
+n.outcome <- 1 ## one outcome
+n.ipc <- stan.fit@sim$iter - stan.fit@sim$warmup  ## number iterations per chain
+n.chain <- stan.fit@sim$chains   ## number of chains
+
+temp <- rstan::extract(stan.fit, pars=c("B"), permuted=FALSE, inc_warmup=F)
+## sanity check...most useful for multiple outcomes
+array(dimnames(temp)[[3]], dim=c(4, n.outcome))
+## Rearrange dimensions to (iteration#, chain#, outcome, ___ )
+## one dimension of temp will be the number of parameters
+## In this case the four B parameters
+
+BB <- array(temp, dim=c(n.ipc, n.chain, 4, n.outcome))
+
+# a sampling of fits, for plotting
+ii <- floor(seq(1,n.ipc,length.out=30)) 
+
+xage <- 50:110
+
+par(mfrow=c(2,2), mar=c(5,5,1,1),las=1)
+
+ypib <- array(0, dim=c(length(xage), length(ii), n.chain))
+for (chain in 1:n.chain)
+  ypib[,,chain] <- sapply(ii, function(i) hyper(BB[i, chain,,1], xage))
+
+for (i in 1:n.chain) {
+  matplot(xage, exp(ypib[,,i]), type='l', log='y',
+          xlab="Age", ylab = paste("Pib", i))
+  grid()
+}
+```
+
+In a sample of 30, the curves are all nearly on top of each other. This is what we 
+would expect from a model that has converged.
+
+
+```{r}
+###############################
+## Plot mean curve per chain
+
+## Might be easier to assess whether all four chains arrived at 
+## the same mean curve than looking at curves from random sample iterations
+
+xage <- 50:110
+y1 <- array(0, dim=c(length(xage), n.ipc, n.chain))
+for (chain in 1:n.chain)
+  y1[,,chain] <- sapply(1:n.ipc, function(i) hyper(BB[i, chain,,1], xage))
+y1 <- apply(y1, c(1,3), mean)
+
+par(mfrow=c(1,1))
+matplot(xage, y1, type='l')
+```
+
+All chains are nearly identical and plotted on top of each other.
+This model has converged.
+
+Recall that the curves based on the per-chain means may differ
+from each other if the model has not converged. The overall
+mean model will be an average of the chains, so the overall
+curve would likely look different from the per-chain curves
+in the situation where we have not reached convergence.
+
+
+
+
+# BRMS
+
+Next, use BRMS to fit a similar NLME model on amyloid PET.  This is not an identical copy, and there could be room for improving on my work here.  But this is as close to identical as I can get at this time.
+
+```{r brmsfit}
+
+## Define prior distributions
+bp1 <- prior(lognormal(0, 1), nlpar = "b1", lb=0) +
+  prior(lognormal(0, 1), nlpar = "b2", lb=0) +
+  prior(lognormal(0, 1), nlpar = "b3", lb=0) +
+  prior(lognormal(0, 1), nlpar = "b5", lb=0) +
+  prior(normal(0, 0.5), nlpar = 'x', coef = 'male') +
+  prior(normal(0, 0.5), nlpar = 'x', coef = 'apoepos') +
+  prior(normal(0, 0.25), nlpar = 'x', coef = 'educ') +
+  prior(normal(0, 5), nlpar = 'x', coef = 'Intercept') ## formerly called 'b4'
+
+# ## To check the class of each element in the initial values
+# ## fit the model as quickly as possible.
+# ## Compiling the model takes a couple seconds, so use if(!exists())
+# if(!exists('.fit')){
+#   .fit <- brm(bf(y ~ b1 + b2*x + 0.5*(b3-b2)*(x + sqrt(x^2 + b5^2)),
+#                b1 + b2 + b3 + b5 ~ 1,
+#                x ~ offset(age10c75) + male + apoepos + educ + (1 | id),
+#             nl = TRUE), data = d, iter = 2, chains=1, cores=1)
+# }
+# cbind(sapply(.fit$fit@inits[[1]], class))
+# str(.fit$fit@inits[[1]])
+
+## Define initial parameters
+## When possible, used the same initial parameters as were passed to rstan
+init_func <- function(chain) {
+  ## standardize the initial alpha values
+  ## Add a little noise to each
+  a2 <- initial.random.effects*runif(length(initial.random.effects),0.95,1.05)
+  a3 <- (a2-mean(a2))/sd(a2)
+  initial_values <- list(
+     b_b1 = array(initial.shape.parm[1] * runif(1, 0.95, 1.05))  #  Initial value for b1
+    ,b_b2 = array(initial.shape.parm[2] * runif(1, 0.95, 1.05))  #  Initial value for b2
+    ,b_b3 = array(initial.shape.parm[3] * runif(1, 0.95, 1.05))  #  Initial value for b3
+    ,b_b5 = array(initial.shape.parm[5] * runif(1, 0.95, 1.05))  #  Initial value for b5
+    ## NOTE: b_x ordered as intercept, male, apoepos, educ
+    ,b_x = array(initial.beta * runif(4,0.95,1.05))
+    ,sd_1 = array(runif(1, 8,11)/10)              # SD of alphas, per decade, same units as age
+    ,sigma = as.numeric(runif(1, 0.01,0.2))       # SD of model
+    ,z_1 = matrix(a3, nrow=1)                     # scaled random effects (alphas)
+  )
+  return(initial_values)
+}
+set.seed(2014)
+nchains <- 4
+init_list <- lapply(1:nchains, init_func)
+
+## this is slow to fit
+if(!file.exists("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/brms.fit.rda")){
+  brms.fit <- brm(bf(y ~ b1 + b2*x + 0.5*(b3-b2)*(x + sqrt(x^2 + b5^2)),
+                 b1 + b2 + b3 + b5 ~ 1,
+                 x ~ offset(age10c75) + male + apoepos + educ + (1 | id),
+                 nl = TRUE),
+              data = d, prior = bp1,
+              init = init_list,
+              iter = 2500,
+              cores = nchains,
+              chains = nchains, seed = 25095,
+              control = list(adapt_delta = 0.95, max_treedepth = 15))
+  save(brms.fit, file="/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/brms.fit.rda")
+} else load("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/brms.fit.rda")
+```
+
+
+```{r brmsquickplots, include=F, eval=F}
+## There are several packages that provide plots to display
+## convergence metrice, review parameter estimates, etc
+
+# Here is a short list of useful summaries and plots from the BRMS package
+# which I like to review, but I will not include in the final document.
+
+## Did the parameters converge to the expected values?
+summary(brms.fit)
+
+## convert covariate effects relative to 1 year of age
+fixef(brms.fit)[5:8,'Estimate']*10
+
+## Was there sufficient mixing?
+plot(brms.fit)
+
+## posterior probability check
+pp_check(brms.fit)
+```
+
+## Check convergence
+
+Verify iniitals were used, runtime in hours, and summarize posterior distributions.
+
+```{r brmsconvergence, fig.height=2.5}
+
+## TIP: $fit is class rstan
+## so we can use all the same code as above on this BRMS model
+class(brms.fit$fit)
+
+###############################
+## Verify initial values were used
+str(brms.fit$fit@inits[[1]])
+str(init_list[[1]])
+
+###############################
+## Runtime, in hours
+rowSums(get_elapsed_time(brms.fit$fit))/60/60
+
+###############################
+## Get parameter summaries of BRMS model (sbm)
+sbm <- summary(brms.fit$fit)
+## List of parameter names
+nmb <- rownames(sbm[[1]])
+```
+
+
+```{r, include=F, eval=F}
+###############################
+## Quick plots to review estimates
+
+## This is useful for amyloid PET because these models are really well understood
+## so I have a good feeling for what these values should be.
+## I am not sure these plots will be as useful for an unfamiliar measure.
+plot(brms.fit$fit, pars=grep('b_b',nmb,value=T))      ## expect c(0.37, 0.05, 0.33, 0.04)
+plot(brms.fit$fit, pars=grep('b_x',nmb,value=T))   ## expect c(-1, -0.15, 0.4, 0.03)
+plot(brms.fit$fit, pars=grep('^r_id',nmb,value=T)[1:10])  ## print the first 10 alphas, btwn -2 to 2 is ok
+plot(brms.fit$fit, pars='sigma')  ## expect between 0.01 and 0.3
+plot(brms.fit$fit, pars=grep('^sd_id',nmb,value=T))   ## expect between 0.7 and 1.0
+```
+
+
+### Rhat
+
+```{r}
+###############################
+## Review Rhat
+
+table(cut(sbm[[1]][,'Rhat'], breaks=c(0.9,1,1.05,1.2,2,100)), useNA='always')
+
+myvars <- c(1,4,8:10)
+
+## best Rhats
+as.data.frame(sbm[[1]]) %>% arrange(Rhat) %>% select(all_of(myvars)) %>% head(20)
+
+## worst Rhats
+as.data.frame(sbm[[1]]) %>% arrange(desc(Rhat)) %>% select(all_of(myvars)) %>% head(20)
+
+```
+
+All Rhats <1.05, which is great! We are OK to assess this model.
+
+
+```{r, include=F, eval=F}
+
+# - divergent transitions - Possible future work
+# 
+```
+
+### Log-likelihood per chain
+
+```{r, fig.height=2.5}
+###############################
+# Review log lik per chain
+
+ll <- sbm[[2]]["lp__",c('50%','2.5%','97.5%'),]
+
+round(ll)
+
+t(ll) %>%
+  as.data.frame %>%
+  rownames_to_column(var='chains') %>%
+  ggplot(aes(y=chains, x=`50%`, xmin=`2.5%`, xmax=`97.5%`)) +
+  geom_pointrange(size=1, color='blue', fill='white', shape=22)
+```
+
+Log-likelihood is similar for all chains, which supports that this model has 
+converged well.
+
+
+```{r}
+###############################
+## To compare the predictions from each chain
+## review a set of curves for each chain
+
+## Have all four chains arrived at the same place?
+## Have the iterations in each chain arrived at the same place?
+
+## Ok to use hyper() defined above
+
+n.outcome <- 1 ## one outcome
+n.ipc <- brms::niterations(brms.fit)  ## number iterations per chain
+n.chain <- brms::nchains(brms.fit)   ## number of chains
+
+temp <- rstan::extract(brms.fit$fit, pars=grep('b_b',nmb,value=T), permuted=FALSE, inc_warmup=F)
+## sanity check...most useful for multiple outcomes
+array(dimnames(temp)[[3]], dim=c(4, n.outcome))
+## Rearrange dimensions to (iteration#, chain#, outcome, ___ )
+## one dimension of temp will be the number of parameters
+## In this case the four B parameters
+
+BB <- array(temp, dim=c(n.ipc, n.chain, 4, n.outcome))
+
+# a sampling of fits, for plotting
+ii <- floor(seq(1,n.ipc,length.out=30)) 
+
+xage <- 50:110
+
+par(mfrow=c(2,2), mar=c(5,5,1,1))
+
+ypib <- array(0, dim=c(length(xage), length(ii), n.chain))
+for (chain in 1:n.chain)
+  ypib[,,chain] <- sapply(ii, function(i) hyper(BB[i, chain,,1], xage))
+
+for (i in 1:n.chain) {
+  matplot(xage, exp(ypib[,,i]), type='l', log='y',
+          xlab="Age", ylab = paste("Pib", i))
+  grid()
+}
+```
+
+Most of the iterations are on top of each other - good.  This indicates that the model
+has shifted people left-right based on a common hyperbola shape. This is how Terry's
+NLMEs are meant to work. 
+
+### Stan model code
+
+For the BRMS model, the stan model code was written by the BRMS package. Document the
+stan model code now
+
+```{r comparestancode}
+stancode(brms.fit)
+```
+
+### Mean curve per chain
+
+```{r}
+###############################
+## Plot mean curve per chain
+
+## Might be easier to assess whether all four chains arrived at 
+## the same mean curve than looking at curves from random sample iterations
+
+xage <- 50:110
+y1 <- array(0, dim=c(length(xage), n.ipc, n.chain))
+for (chain in 1:n.chain)
+  y1[,,chain] <- sapply(1:n.ipc, function(i) hyper(BB[i, chain,,1], xage))
+y1 <- apply(y1, c(1,3), mean)
+
+par(mfrow=c(1,1))
+matplot(xage, y1, type='l')
+```
+
+<!-- Each chain appears to have converged to the same shape. Based on the previous -->
+<!-- plots and convergence metrics, we are not surprised by that. The chains are nearly  -->
+<!-- identical such that they overlay each other. -->
+
+# Other Stan packages 
+
+There are several packages which include functions to evaluate 
+Stan model convergence, make predictions, summarize posterior distributions,
+and more. I will mention a couple packages here, but I am not familiar with them
+myself so I will not provide examples.
+
+ - `tidybayes`
+ - `brms`
+ - `rstanarm`
+
+```{r brmstidybayesplots, include=F, eval=F}
+# These plots follow examples in a tidybayes tutorial
+# I am unsure if it is helpful for Terry's NLME type models
+# I am included it here for my own reference, but will
+# exclude this code from the html document
+library(tidybayes)
+
+gather_draws(brms.fit,b_b1_Intercept,b_b2_Intercept) %>%
+  median_qi(.width=c(0.95,0.66)) %>%
+  ggplot(aes(y=.variable, x=.value, xmin=.lower, xmax=.upper)) +
+  geom_pointinterval()
+
+spread_draws(brms.fit,b_b1_Intercept,b_b2_Intercept) %>% median_qi
+
+gather_draws(brms.fit,r_id__x[id,Intercept])
+```
+
+
+# Compare Rstan vs BRMS
+
+Finally, show whether the estimates and shape of the fit are the same, or similar,
+for Rstan vs BRMS.
+
+Things to compare:
+
+Estimates of
+ - Bs
+ - betas
+ - alphas
+ - SDs
+ - adjusted amyloid age
+
+It would be nice to show a figure showing the shape of the fit from each model.
+
+
+```{r compareB, fig.width=5, fig.height=3, fig.cap="Compare B parameters that define the shape of the hyperbola."}
+xlim <- c(0,0.5)
+ggpubr::ggarrange(ncol=1,
+  plot(brms.fit$fit, pars=grep("^b_b",nmb,value=T)) + xlim(xlim) + labs(title='BRMS'),
+  ggpubr::ggarrange(NULL, plot(stan.fit, pars='B') + xlim(xlim) + labs(title='Rstan'), ncol=2, widths=c(0.22,1)))
+```
+
+The parameter that defines the softness of the bend (b_b5_Intercept, B[4]) 
+is not quite as similar as I was expecting it to be.
+
+```{r comparebeta, fig.height=4, fig.cap="Compare covariate estimates (beta)."}
+xlim <- c(-2,2)
+ggpubr::ggarrange(ncol=1,
+  plot(brms.fit$fit, pars=grep("^b_x",nmb,value=T)) + lims(x=xlim) + labs(title='BRMS'),
+  ggpubr::ggarrange(NULL, plot(stan.fit, pars='beta') + lims(x=xlim) + labs(title='Rstan'), ncol=2, widths=c(0.09,1)))
+```
+
+Estimates for covariate effects appear to be quite similar between the two
+models.
+
+```{r comparesd, fig.height=1.5, fig.cap="Compare standard deviation of randome effects (SD of alphs, atau) and residual standard deviation (sigma)."}
+xlim <- c(0.03,0.05)
+ggpubr::ggarrange(ncol=1,
+  plot(brms.fit$fit, pars="sigma") + lims(x=xlim) + labs(title='BRMS'),
+  plot(stan.fit, pars='sigma') + lims(x=xlim) + labs(title='Rstan'))
+
+xlim <- c(0.8,1.6)
+ggpubr::ggarrange(ncol=1,
+  plot(brms.fit$fit, pars="sd_id__x_Intercept") + lims(x=xlim) + labs(title='BRMS'),
+  ggpubr::ggarrange(NULL, plot(stan.fit, pars='atau') + lims(x=xlim) + labs(title='Rstan'), ncol=2, widths=c(0.21,1)) + labs(title='Rstan'))
+
+```
+
+The standard deviations are very similar between the two models, and appear
+to have converge to a similar mean and credible interval.
+
+```{r comparealpha, fig.height=5}
+xlim <- c(-5,5)
+ggpubr::ggarrange(ncol=1,
+  plot(brms.fit$fit, pars=grep("^r_id",nmb,value=T)[1:10]) + lims(x=xlim) + labs(title='BRMS'),
+  ggpubr::ggarrange(NULL, plot(stan.fit, pars=grep('alpha',nms,value=T)[1:10]) + lims(x=xlim), ncol=2, widths=c(0.18,1)) + labs(title='Rstan'))
+
+```
+
+Review the first 10 alphas. It appears that these two models have converged
+to similar values in this sample.  A more thorough check of all alphas should
+be done.
+
+
+```{r compareloglik, fig.height=1.5}
+xlim <- c(1800,4000)
+ggpubr::ggarrange(ncol=1,
+  plot(brms.fit$fit, pars="lp__") + lims(x=xlim) + labs(title='BRMS'),
+  plot(stan.fit    , pars='lp__') + lims(x=xlim) + labs(title='Rstan'))
+```
+
+I am surprised that the mean values for so many parameter are the same, or 
+very similar, and yet the log-likelihoods for these two models are remarkably
+different. 
+
+Despite a good effort to set up these models similarly, there are some 
+differences that I cannot explain. One thing that was specified differently
+was the priors - I used lognormal for the Bs in the BRMS model vs normal 
+in Rstan. Could that be related to why the log-Likelihoods differ? The 
+answer to that question seems to be above my pay-grade.
+
+Why did I choose to use lognormal for the BRMS model? There is not a great
+reason for this other than in one of the BRMS examples, lognormal was used.
+And because the ghyper model was parameterized such that it is monotine 
+increasing, it seemed like the model fit faster in early iterations when 
+using lognormal priors.  I am no longer convinced that there was a huge 
+amount of time saved based on this choice. But the BRMS model DID fit in
+slightly less time vs Rstan.
+
+That difference could be due to the way the stan model code was set up. 
+For Rstan, I defined this myself.  For the BRMS model, it was defined 
+automatically.  The stan model code can be viewed for the BRMS model.
+
+Another difference BRMS vs Rstan, is that BRMS does some standardization 
+prior to fitting the model. The output is unscaled automatically, so for 
+the most part that happens without the user being aware. One instance when
+that was a nuisance when passing initial random effects. The model required
+that I pass standardized random effects, and otherwise would ignore initial
+values for random effects. A novice user of BRMS could easily be unaware of
+this issue and have no idea some initial values were ignored. At least,
+this is my current understanding.
+
+```{r printsummaries, results='asis'}
+keep <- c('mean','se_mean','sd','2.5%','97.5%','n_eff','Rhat')
+ssm[[1]][1:12, keep] %>% kable(caption='Summaries of some Rstan model parameters')
+sbm[[1]][1:12, keep] %>% kable(caption='Summaries of some BRMS model parameters')
+
+```
+
+Now, let's overlay the mean curve and see if visually the softness really
+differs by that much.
+
+The overall mean curves are very similar. It would be hard to claim that
+these models differ markedly, despite the value of the softness parameter
+being slightly less sharp in the BRMS model.
+
+```{r compareshape}
+
+B.rstan <- ssm$summary[1:4,'mean']
+B.brms <- sbm$summary[1:4,'mean']
+
+xage <- 50:110
+
+par(mfrow=c(1,1), mar=c(5,5,1,1))
+
+pred.pib.rstan <- hyper(B.rstan, xage)
+pred.pib.brms <- hyper(B.brms, xage)
+
+plot(xage, exp(pred.pib.rstan), type='l', log='y',
+     xlab = "Age", ylab = "Pib",
+     col=col.universal[3], lty=1, lwd=5)
+points(xage, exp(pred.pib.brms), type='p', col=col.universal[4], pch=20, cex=0.5)
+points(xage, exp(pred.pib.brms), type='l', col=col.universal[4], lty=1, lwd=2)
+grid()
+legend('topleft',col=col.universal[c(3,4)], legend=c('RStan','BRMS'), 
+       lty=c(1,1), pch=c(0,20), pt.cex=c(0,2), lwd=c(5,2)) 
+```
+
+
+Compute adjusted amyloid age from each model and compare/contrast. 
+This is one of the metrics we are most interested in, so being able 
+to compute the same per-person values from each model is important.
+
+
+```{r compareadjage}
+
+## Things we will need that are already defined:
+## the data list
+## model iterations
+## summaries of the model
+## n.outcome, n.chain, n.ipc
+
+n.ppl <- stan.list$M
+n.iters <- n.chain*n.ipc
+
+###############################
+## Adjusted amyloid age from RStan model
+###############################
+
+## Computing additional summaries requires
+## post-warmup iterations
+## permuted=T gets (iter, parm)
+## This model included a single outcome, so there is no third dimension.
+alpha.all <- rstan::extract(stan.fit, "alpha", permuted=T, inc_warmup=F)[[1]]
+beta.all  <- rstan::extract(stan.fit, "beta", permuted=T, inc_warmup=F)[[1]]
+
+## Calculate linear predictor 'covariate adjusted offset'
+## in decades
+## (XX iter stacked by chain, per person)
+eta.all <- array(0, dim = c(n.iters, n.ppl),
+                 dimnames = list('iteration'=1:n.iters, 
+                                 'id'=1:n.ppl))
+aX <- stan.list$X[!duplicated(stan.list$id),]
+
+## Drop the intercept from this computation, per convo with Terry
+## Do not need to incorporate the l-r intercept as part of  
+## individual estimate of adjusted amyloid age.  
+## Add l-r intercept back to the overall curve
+aX <- aX[,-1]; beta.all <- beta.all[,-1]
+for(i in 1:n.iters) {
+    eta.all[i,] <- alpha.all[i,] + aX[,] %*% beta.all[i,]
+  }
+
+## covar-adjusted offset avg'd over iterations
+eta <- apply(eta.all, 2, mean)
+
+## adjusted age
+adj.age.rstan <- stan.list$age + eta[stan.list$id]
+
+## delete these objects cuz names will be reused
+rm(alpha.all, beta.all, eta.all, eta)
+
+###############################
+## Adjusted amyloid age from BRMS model
+###############################
+
+## Computing additional summaries requires
+## post-warmup iterations
+## permuted=T gets (iter, parm)
+## This model included a single outcome, so there is no third dimension.
+alpha.all <- bind_rows(rstan::extract(brms.fit$fit, pars=grep('r_id',nmb,value=T), permuted=T, inc_warmup=F)) %>% as.matrix
+beta.all  <- rstan::extract(brms.fit$fit, "b_x", permuted=T, inc_warmup=F)[[1]]
+
+## Calculate linear predictor 'covariate adjusted offset'
+## in decades
+## (XX iter stacked by chain, per person)
+eta.all <- array(0, dim = c(n.iters, n.ppl),
+                 dimnames = list('iteration'=1:n.iters, 
+                                 'id'=1:n.ppl))
+aX <- stan.list$X[!duplicated(stan.list$id),]
+
+## Drop the intercept from this computation, per convo with Terry
+## Do not need to incorporate the l-r intercept as part of  
+## individual estimate of adjusted amyloid age.  
+## Add l-r intercept back to the overall curve
+aX <- aX[,-1]; beta.all <- beta.all[,-1]
+for(i in 1:n.iters) {
+    eta.all[i,] <- as.numeric(alpha.all[i,] + aX %*% beta.all[i,])
+  }
+
+## covar-adjusted offset avg'd over iterations
+eta <- apply(eta.all, 2, mean)
+
+## adjusted age
+adj.age.brms <- stan.list$age + eta[stan.list$id]
+
+###############################
+## Put the data together
+###############################
+d$adj.age.rstan <- adj.age.rstan*10 + 75
+d$adj.age.brms <- adj.age.brms*10 + 75
+d$age.in.years <- d$age10c75*10 + 75
+```
+
+Show the relationship between amyloid PET SUVR and age.  
+The correlation between adjusted amyloid age from Rstan and from BRMS
+is very high, hence all the trajectories are on top of each other.
+
+The relationship between amyloid SUVR and adjusted amyloid age is nearly identical
+BRMs vs Rstan. These plots are some of the most imporant plots used
+in publication, so it is critical that adjust amyloid ages are estimated
+to be the same between the two methods.
+
+```{r, fig.height=7,fig.width=7}
+p1 <- pfun2(d, mapping=aes(x=age.in.years, y=exp(y))) +
+  labs(y='PiB SUVR', x='Age, years')
+p2 <- pfun2(d, mapping=aes(x=adj.age.rstan, y=exp(y))) +
+  labs(y='PiB, SUVr',x='Rstan model adj. age, years')
+p3 <- pfun2(d, mapping=aes(x=adj.age.brms, y=exp(y))) +
+  labs(y='PiB, SUVr', x='BRMS model adj. age, years')
+p4 <- pfun2(d, mapping=aes(x=adj.age.brms, y=adj.age.rstan)) +
+  labs(x='BRMS adj. age',y='Rstan adj. age')
+
+ggpubr::ggarrange(p1,p2,p4,p3, ncol=2,nrow=2)
+
+```
+
+### Individual adjustments (alphas)
+
+```{r}
+###############################
+## Add individual adjustments (alphas), per outcome, in years
+###############################
+alpha.rstan <- ssm[[1]][grepl('alpha',nms), 'mean']
+## mult by 10 to convert to years, not decades
+d$alpha.rstan <- alpha.rstan[stan.list$id] * 10
+
+alpha.brms <- sbm[[1]][grepl('r_id',nmb), 'mean']
+d$alpha.brms <- alpha.brms[stan.list$id] * 10
+```
+
+```{r, fig.height=4,fig.width=4}
+lim<-c(-40,40); par(mfrow=c(1,1))
+plot(alpha.rstan ~ alpha.brms, data = d, subset=!duplicated(d$id), 
+     xlim=lim,ylim=lim)
+grid()
+abline(0,1,lty=2,col=2)
+```
+
+The individual random effects are highly correlated.
+
+# Use cases for BRMS
+
+There may be other uses for BRMS, but for now I can see value in:
+
+- getting initial values using algorithm meanfield
+
+- exploring new outcomes quickly
+
+- get estimate of alpha SD using algorithm meanfield
+
+
+
+## Using algorithm meanfield to get initial values
+
+The NLME models we fit are complex thus require NUTS for a 
+good model.
+However, if we want to get initial values quickly, we can try to
+fit a model with variational inference.
+
+Allow for variational inference with independent normal
+distributions.  This model fits quickly, and can get us
+a set of decent initial values.
+
+
+```{r meanfield}
+# Define the formula
+mybf <- bf(y ~ b1 + b2*x + 0.5*(b3-b2)*(x + sqrt(x^2 + b5^2)),
+               b1 + b2 + b3 + b5 ~ 1,
+               x ~ offset(age10c75) + male + apoepos + educ + (1 | id),
+            nl = TRUE)
+
+if(file.exists("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/vi.fit.rda")) {
+  load("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/vi.fit.rda")
+}
+  
+# Fit the variational approximation
+if(!exists('vi.fit')){
+vi.fit <- brm(mybf, data = d, prior=bp1,
+              algorithm="meanfield", tol_rel_obj = 0.01,
+              iter=10000, seed=2010)
+}
+
+## Extract estimates, and pass as a list of length two,
+## once per chain.  Could consider added noise.
+vi.inits <- list(vi.fit$fit@sim$est, vi.fit$fit@sim$est)
+
+if(!exists('nuts.fit')){
+nuts.fit <- brm(mybf, data = d, prior=bp1,
+                iter=8, chains = 2, seed=3010, init=vi.inits)
+}
+
+```
+
+Verify initial values were used in the first chain.
+
+```{r}
+str(nuts.fit$fit@inits[[1]])
+str(vi.inits[[1]])
+```
+
+## Using algorithm meanfield to get estimate of alpha SD
+
+We can use the VI fit to get a reasonable estimate of the mean alpha SD for amyloid PET.
+The CI from the VI fit would not be appropriate to use, as it is too narrow.
+
+```{r alphaSD}
+# Extract the standard deviations of the group-level effects
+# ignore the deprecated warning - this code works nicely so that 
+# we do not have to specify the full variable name
+vi.alpha.sd <- posterior_summary(vi.fit, pars = "^sd_")
+
+brms.alpha.sd <- posterior_summary(brms.fit, pars ="^sd_")
+
+out <- rbind(vi.alpha.sd, brms.alpha.sd) %>%
+  as.data.frame %>%
+  rownames_to_column %>%
+  cbind('Model'=c('vi.fit','brms.fit'),.)
+
+kable(select(out, -rowname), 
+      caption = 'Estimated SD of subject-specific intercepts (alpha) from VI vs BRMS models')
+
+```
+
+On the other hand, algorithm meanfield was unable to estimate 
+reasonable random effect standard deviations for a more complex
+model on cognition.
+I realized I had two reports with contradictory results regarding
+estimating gamma SD and alpha SD in a model on cognition.
+
+ - Model A: gamma SD = 0.9z, alpha SD = **0.1** years
+ - Model B: gamma SD = 0.9z, alpha SD = **8.7** years
+ 
+For more details about these models see:  
+  `\projects\bsi\neuro\s101846.adir\Cogswell\Plasma-pet-cognition-patterns\pgm\`  
+  `a13-memory-random-slopes-baselines.html`
+
+  `/bigdata/bsi/neuro/s101846.adir/Cogswell/Plasma-pet-cognition-patterns/pgm/`  
+  `a13-brm1.rda` where vi1 is like model A and brm1 is like model B
+
+These models used the same data, same formula to define the model, the same priors. 
+The most important differences was which algorithm was used for estimation:
+
+ - Model A: meanfield, the Variational inference approximation model
+ - Model B: NUTS algorithm, standard MCMC (but slow)
+
+My conclusion is that it is not ok to use the variational approximation model 
+in order to estimate the alpha SD parameter, if that estimate is going to be
+passed as a fixed value in a joint NLME model.
+ 
+**Lesson learned: algorithm 'meanfield' from the BRMS package to fit variation**
+**approximation models should be used to get initial values ONLY, nothing more.**
+
+Currently, BRM throws a warning that meanfield algorithm is experimental.
+So we do not trust it as well as we do the NUTS algorithm.
+
+`Chain 1: ------------------------------------------------------------`  
+`Chain 1: EXPERIMENTAL ALGORITHM:`  
+`Chain 1:   This procedure has not been thoroughly tested and may be unstable`  
+`Chain 1:   or buggy. The interface is subject to change.`  
+`Chain 1: ------------------------------------------------------------`  
+
+# Conditioning on PiB and Tau to get proportion of alpha z explained by both biomarkers
+
+Question: Do pib and tau together explain more variation in the alphas for memory Z?
+
+The alphas are jointly multivariate normal, so we can compute this 
+from the components of the Omega matrix.
+We need the mean and variance of the conditional distribution
+
+α[i, 1] | α[i, 2], α[i, 3].
+
+where 1 is z, 2 and 3 are PiB and tauPET.
+
+Stephen Weigand provided the following link to conditional distributions:
+https://en.wikipedia.org/wiki/Multivariate_normal_distribution#Conditional_distributions
+
+If one wants the distribution α[i, z] | α[i, PiB], α[i, TauPET],
+I think one could use the Wikipedia formula. Then I think 
+[sigma_12*sigma_22^-1] evaluates to a pair of “derived regression 
+coefficients” for the conditional mean of α[i, z] given α[i, PiB] 
+and α[i, TauPet].
+
+Let marginal variance sigma_11 be omega['z','z'] and
+the conditional variance of α[i, z] is [sigma_12 * sigma_22^-1 * sigma_21].
+
+Then the proportion of variance explained in α[i, z] by PiB and TauPET,
+would be conditional variance divided by the marginal.
+
+I'm not totally confident that the 1/2/3 for z/pib/tau is exactly
+correct because my omega is 3x3 but the example on Wikipedia and in
+Stephen's email was 2x2.
+
+think more on this later....
+
