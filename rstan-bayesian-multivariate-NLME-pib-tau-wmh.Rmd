@@ -1,0 +1,1643 @@
+---
+title: "Rstan to fit Bayesian MCMC multivariate NLME on pib, tau, and WMH%"
+author: "Emily Lundt"
+date: "`r format(Sys.Date(),'%B %e, %Y')`"
+output: 
+  bookdown::html_document2: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+```
+
+# Background
+
+In 2021, Terry Therneau published the inaugural publication using Rstan to fit
+non-linear mixed effects (NLME) models.  
+See https://pubmed.ncbi.nlm.nih.gov/34333107/. At that time, he was using the name 'AFT model'
+and now I more accurately call them by multivariate NLME models.
+
+I should note that the name is not perfectly settled. More recently,
+Terry and Mingzhao have called them GLMEs.  One could also debate
+which term 'joint' versus 'multivariate' is most correct. 
+
+This document was created to have everything you need in
+one place. That means this document should be able to run top-to-bottom,
+once the directory is updated to your own. For a project,
+best practice will be to set up a set of folders and files for 
+each model.  Often models will take hours to run, thus it is not
+feasible to have everything in a single file.
+
+*Getting started at Mayo* can be slow for some. Thus, I will document
+some what I use in order to get Rstan to run:
+Rstudio via on-prem Rstudio server (node 04 or 05) and Rv4.3.2.
+
+# Purpose
+
+In this tutorial, the Rstan package will be used 
+to fit a Bayesian MCMC multivariate NLME model on
+three outcomes. 
+
+The outcome in this model are amyloid-PET SUVR, tau-PET SUVR, and WMH% of TIV.  
+The data will be a simulated dataset loaded from Terry's github page.
+
+I will show how to extract estimates and summarize the model.  
+
+There is a section currently "in progress' to compute the marginal covariance of individual adjustments.
+ 
+The document will be a reference for myself, and can be expanded to include
+more concepts.  It could potentially serve as a light-weight
+introduction to fitting these types of models.
+
+There is a section to compute proportion over threshold curves, 
+using two computation methods.  Theoretically, these should be 
+identical, but in my example there is a slight difference.
+
+Future section to add would be a more complex model including both left-right covariates 
+with units on the age scale, and up-down covariates with units on
+the scale of a given outcome.  
+
+In this example, I will only include left-right covariates.
+
+<!-- Future work: Create fake cognition data. 
+Find the original subjects’ visits, and simulate cognition data,
+maybe add more visits if not too hard. -->
+
+<!-- Future work: Add some additional criteria to reign in tau -->
+<!-- in particular and prevent it from having such a wide range -->
+<!-- of alpha values. Link to pib? fix alpha sd vs estimate it? -->
+
+# Setup the data
+
+```{r setup1, warning=F, results='hide', message=F}
+###############################
+## Load packages, functions
+###############################
+library(tidyverse)
+library(rstan)
+library(brms)
+
+## Instead of loading the knitr library, just load this function
+kable <- function(...) knitr::kable(...)
+
+###############################
+## Load simulated data
+###############################
+# URL of the raw file on GitHub
+# Must replace /blob with /raw
+# github_url <- "https://github.com/therneau/AFTmodel/raw/master/fourmarker/simdata.rds"
+ 
+# Local path where you want to save the file
+local_path <- "./simdata.rds"
+ 
+# Download the file from GitHub
+# utils::download.file(url = github_url, destfile = local_path, method="auto", quiet = FALSE)
+
+# Load the downloaded file into R
+simdata <- readRDS(local_path)
+
+###############################
+## Data for these analyses
+###############################
+
+## Keep MCSA subjects having APOE genotyping
+d1 <- filter(simdata, outcome %in% c('amyloid','tau','wmh'), apoemiss == 0, adrc == 0) %>%
+  mutate(y.unscaled = case_when(outcome %in% 'amyloid' ~ exp(y),
+                                outcome %in% 'tau' ~ exp(y),
+                                outcome %in% 'wmh' ~ y*5))
+
+## Add some useful vars
+d2 <- d1 %>%
+  group_by(id) %>%
+  mutate(age.at.start = first(age)) %>%
+  add_tally(outcome %in% 'amyloid', name='npib') %>%
+  add_tally(outcome %in% 'tau', name='ntau') %>%
+  add_tally(outcome %in% 'wmh', name='nwmh') %>%
+  ## covars rescaled
+  mutate(age10c75 = (age - 75)/10,
+         educ4c14 = (educ-14)/4) %>%
+  ungroup()
+
+## Limit to the most informative subjects, having serial data
+d3 <- filter(d2, npib >= 4 | ntau >=3 | nwmh >= 4)
+
+## this step must come after filtering, as this is a fake ID
+## to be passed to rstan
+d4 <- d3 %>%
+  ## ID variables must be a count from 1, 2, ...
+  mutate(id = as.numeric(factor(id)))
+
+d <- ungroup(d4)
+
+
+###############################
+# Color-blind friendly palette
+###############################
+col.universal <- c(Orange = "#E69F00", `Sky blue` = "#56B4E9", `Bluish green` = "#009E73", 
+                   Yellow = "#F0E442", Blue = "#0072B2", Vermillion = "#D55E00", 
+                   `Reddish purple` = "#CC79A7")
+
+###############################
+## Set up a function to plot trajectories over time
+###############################
+## Make it generic enough to accept
+## different x's and y's
+pfun2 <- function(data, ...) {
+  .d <- mutate(data, color = as.character(factor(id %% 7, 0:6, col.universal)),
+         alpha = ifelse(id %% 2 == 0, 1, 0.7))
+  ggplot(data=.d, ...) +
+    geom_line(aes(group=id, color=color, alpha=alpha)) +
+    theme(legend.position='none') +
+    ## Set color and alpha to value in dataset
+    scale_color_identity() +
+    scale_alpha_identity() +
+    ## Set aspect ratio so each panel is square
+    theme(aspect.ratio = 1)
+}
+
+###############################
+## Set plot defaults
+###############################
+theme_set(theme_bw())
+## update axes, borders to black. not gray
+theme_update(
+  axis.text = element_text(color = "black"),
+  panel.border = element_rect(color = "black"))
+
+###############################
+## Setup for multiple cores
+###############################
+options(digits = 3, mc.cores = 4)
+
+
+```
+
+
+The simulated dataset was stacked per-person per-visit per-outcome.  
+
+We have limited to MCSA visits with and having APOE genotype. Subjects must have
+serial outcome data of 4+ pibs or 3+ taus or 4+ WMH%.
+
+Summarize the data.
+
+`y` is the scaled/transformed value of log amyloid, log tau, or WMH% per 5
+
+`y.unscaled` is the unscaled value of amyloid, tau, or WMH%
+
+```{r, results='asis'}
+summarytools::dfSummary(d, plain.ascii = FALSE, style = "grid", valid.col=F, 
+                        tmp.img.dir = "/tmp")
+```
+
+Plot a sample of trajectories.
+
+```{r amyloidtrajectories}
+set.seed(102)
+ptlst <- d %>% filter(!duplicated(id)) %>%
+  mutate(agedecade = cut(age.at.start, c(50,60,70,80,90,Inf))) %>%
+  slice_sample(n=10, by=agedecade, weight_by=nwmh + npib + ntau**10) %>% 
+  pull(id)
+
+pdat <- filter(d, id %in% ptlst)
+
+pdat %>%
+  pfun2(., mapping=aes(x=age, y=y.unscaled)) +
+  geom_point(size=0.2, aes(color=color)) +
+  facet_wrap(~outcome, scales='free_y', ncol=2)
+```
+
+
+
+# Fit the model
+
+Use Rstan to fit an NLME model on three outcomes.
+
+Try to use the most recent workflow, and to include all code within this document.
+
+## Format the data as a list for stan
+
+```{r stanlist}
+## left-right covariates
+x1vars <- c('male','apoepos','educ4c14')
+
+stan.list <- list(N = nrow(d),                    ## total count obs
+                  M = length(unique(d$id)),       ## total count subjects
+                  P1 = length(x1vars)+1,           ## total count covars plus intercept in X1mat
+                  K = length(unique(d$outcome)),  ## total count outcomes
+                  ## transformations of y-values so that all outcomes
+                  ## have a similar scale will improve the model fit
+                  ## In this case, y is already transformed
+                  y = d$y,
+                  outcome = as.numeric(d$outcome),
+                  outcome.label = as.character(d$outcome),
+                  ## Age at y, centered and scaled more stable for rstan
+                  age = d$age10c75,
+                  ## left-right covariate matrix, as.matrix so stan is happy
+                  ## includes intercept
+                  X1 = as.matrix(cbind(1, d[,x1vars])),
+                  id = d$id
+                  )
+```
+
+
+## Get initial values 
+
+In this example, fit an NLME model on each outcome using
+the meanfield algorithm of BRMS.  This allows for 
+variational inference with independent normal
+distributions.  This model fits quickly, relative to the NUTS
+algorithm, and can get us a set of decent initial values
+for most outcomes measures.
+
+```{r getinitial}
+###############################
+## Compute initial values
+###############################
+
+library(brms)
+
+set.seed(240)
+
+if(file.exists("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/vi-pib-tau-wmh.rda")) {
+  load("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/vi-pib-tau-wmh.rda", verbose=T)
+}
+  
+# Define a monotone increasing prior
+myp <- prior(normal(0, 1), nlpar = "b1", lb=0) +
+  prior(normal(0, 1), nlpar = "b2", lb=0) +
+  prior(normal(0, 1), nlpar = "b3", lb=0) +
+  prior(normal(0, 1), nlpar = "b5", lb=0) 
+
+# Define the formula
+mybf <- bf(y ~ b1 + b2*x + 0.5*(b3-b2)*(x + sqrt(x^2 + b5^2)),
+               b1 + b2 + b3 + b5 ~ 1,
+               x ~ offset(age10c75) + male + apoepos + educ4c14 + (1 | id),
+            nl = TRUE)
+
+# Fit the variational approximation
+if(!exists('vi.pib')){
+vi.pib <- brm(mybf, data = filter(d, outcome=='amyloid'), 
+              algorithm="meanfield", tol_rel_obj = 0.01,
+              iter=10000, seed=2010)
+}
+# NOTE: default prior worked better for pib
+
+if(!exists('vi.tau')){
+vi.tau <- brm(mybf, data = filter(d, outcome=='tau'), prior=myp,
+              algorithm="meanfield", tol_rel_obj = 0.01,
+              iter=10000, seed=2010)
+}
+
+if(!exists('vi.wmh')){
+vi.wmh <- brm(mybf, data = filter(d, outcome=='wmh'), prior=myp,
+              algorithm="meanfield", tol_rel_obj = 0.01,
+              iter=10000, seed=2010)
+}
+
+par(mfrow=c(2,2))
+ages <- 50:100
+newd <- data.frame(age10c75 = (ages-75)/10, male = 0.5, apoepos = 0.5, educ4c14 = 0, id=9999)
+
+pred <- predict(vi.pib, newdata = newd, allow_new_levels=T)[,'Estimate']
+plot(exp(pred) ~ ages, ylab = 'pib')
+
+pred <- predict(vi.tau, newdata = newd, allow_new_levels=T)[,'Estimate']
+plot(exp(pred) ~ ages, ylab = 'tau')
+
+pred <- predict(vi.wmh, newdata = newd, allow_new_levels=T)[,'Estimate']
+plot(pred*5 ~ ages, ylab = 'wmh%')
+
+if(!file.exists("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/vi-pib-tau-wmh.rda")) {
+  save(vi.pib, vi.tau, vi.wmh,
+       file = "/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/vi-pib-tau-wmh.rda")
+}
+
+###############################
+## Extract and format initial values to pass to stan
+###############################
+
+mods <- list(vi.pib, vi.tau, vi.wmh)
+names(mods) <- c('pib','tau','wmh')
+
+## left-right covars 
+(initial.beta.x1 <- sapply(mods, FUN=function(.x) fixef(.x)[5:8,'Estimate']))
+
+## shape parameters
+(initial.shape.parm <- sapply(mods, FUN=function(.x) fixef(.x)[1:4,'Estimate']))
+
+## sigma 
+(initial.sigma <- sapply(mods, FUN=function(.x) VarCorr(.x)[[2]][[1]][,'Estimate']))
+
+## SD of random alpha
+(initial.alpha.sd <- sapply(mods, FUN=function(.x) VarCorr(.x)[[1]][[1]]['x_Intercept','Estimate']))*10
+
+## Not all measures have random effect alpha for each ppt, need to add 0s
+## and order the same as the data
+uid.all <- unique(d$id)
+uid.pib <- filter(d, outcome=='amyloid') %>% pull(id) %>% unique
+uid.tau <- filter(d, outcome=='tau') %>% pull(id) %>% unique
+uid.wmh <- filter(d, outcome=='wmh') %>% pull(id) %>% unique
+
+alpha.pib <- ranef(vi.pib)[[1]][,'Estimate','x_Intercept']
+alpha.pib.all <- alpha.pib[match(uid.all, uid.pib)]
+alpha.pib.all[is.na(alpha.pib.all)] <- 0
+
+alpha.tau <- ranef(vi.tau)[[1]][,'Estimate','x_Intercept']
+alpha.tau.all <- alpha.tau[match(uid.all, uid.tau)]
+alpha.tau.all[is.na(alpha.tau.all)] <- 0
+
+alpha.wmh <- ranef(vi.wmh)[[1]][,'Estimate','x_Intercept']
+alpha.wmh.all <- alpha.wmh[match(uid.all, uid.wmh)]
+alpha.wmh.all[is.na(alpha.wmh.all)] <- 0
+
+initial.random.effects <- cbind(alpha.pib.all, alpha.tau.all, alpha.wmh.all)
+rownames(initial.random.effects) <- uid.all
+head(initial.random.effects)
+summary(initial.random.effects*10)
+
+## sanity check...approx omega matrix of the pairwise correlations between random effects
+cor(initial.random.effects)
+
+```
+
+
+
+## Define the stan code to fit the NLME model
+
+In this version of the stan model code, the shape of the fit
+is defined by five parameters: the four estimated Bs plus the
+intercept in betaX1.
+
+B[1,] is up-down shift (intercept)  
+B[2,] is initial slope   
+B[3,] is final slope  
+B[4,] is sharpness/smoothness  
+betaX1[1,] is left-right shift (intercept)  
+
+```{r stanmodelcode}
+## stan model code = smc
+smc <- "
+// Stan for a multivariate nonlinear mixed effects model
+// hyper2 is for outcomes that are monotone increasing (e.g. amyloid, wmh)
+// X1 = left-right covariate effects plus intercept (e.g. male, educ)
+
+
+functions {
+    real hyper2(real b1, real b2, real b3, real b4, real eta) {
+       return(b1 + b2*eta + .5*(b3-b2)*(eta + sqrt(eta^2 + b4^2)));
+    }
+}
+
+data {
+  int<lower=0> M;  // number of persons (subjects)
+  int<lower=0> N;  // number of observations
+  int K;           // number of markers
+  int P1;          // number of left-right covariates plus intercept 
+  real y[N];       // observed marker values
+  real age[N];     // age
+  matrix[N, P1] X1;  // left-right covariates 
+  int  id[N];      // the id index, 1,2 etc
+  int  outcome[N]; // which marker for each data row
+}  
+
+parameters {
+   real<lower=0> sigma[K];   // residual SD
+   matrix [P1,K] betaX1;     // left-right regression coefficients
+   matrix [M, K] alpha;      // random left-right offsets per subject and marker
+   corr_matrix[K] Omega;     // correlation
+   real<lower=0> B[4,K];     // parameters of the hyperbola
+   vector<lower=0>[K] atau;  // alpha SD
+}
+transformed parameters {
+   matrix[N,K] linX1;   //  left-right linear predictors 
+   vector[N] eta;
+   vector[N] yhat;
+   row_vector[K] zero;
+
+   zero = rep_row_vector(0,K);
+   linX1 = X1*betaX1;  
+     
+   for (i in 1:N){
+       eta[i] = age[i] + alpha[id[i], outcome[i]] + linX1[i, outcome[i]];
+       yhat[i] = hyper2(B[1, outcome[i]], // up-down shift
+                        B[2, outcome[i]], // initial slope
+                        B[3, outcome[i]], // final slope
+                        B[4, outcome[i]], // sharpness/smoothness
+                        eta[i]);          // left-right shift coef is beta[1,]
+   }
+}
+
+model {
+   for(k in 1:K){
+     B[,k] ~ normal(0,5);
+     betaX1[,k] ~ normal(0, 5); // coefs scaled as decade of age
+     atau[k] ~ normal(0, 2);
+     sigma[k] ~ normal(0, 1);
+   }
+   Omega ~ lkj_corr(2);
+   matrix[K, K] Sigma_beta;  // not worth inspecting, review Omega and atau
+   Sigma_beta = quad_form_diag(Omega, atau);
+   for (j in 1:M) {
+      alpha[j,] ~ multi_student_t(10, zero, Sigma_beta);
+   }
+   for (i in 1:N) {
+      y[i]  ~ normal(yhat[i], sigma[outcome[i]]);
+   }
+}
+"
+
+```
+
+## Run the model
+
+```{r rstanfit}
+## Set up to pass initial values
+K <- stan.list$K # number of outcomes
+
+## A function to generate initial values per chain
+## Add a small amount of noise to each value, so chains are
+## not starting at exactly the same place
+init.fun <- function(chain.id=1) {
+  a3 <- initial.random.effects * runif(length(initial.random.effects), 0.95, 1.05)
+  omega <- round(cor(a3, use="pairwise"),2)
+  list(
+    betaX1  = initial.beta.x1 * runif(length(initial.beta.x1), 0.95, 1.05)
+    ,alpha = a3
+    ,Omega = omega
+    ,atau = initial.alpha.sd * runif(length(initial.alpha.sd), 0.95, 1.05)
+    ,sigma = initial.sigma * runif(length(initial.sigma), 0.95, 1.05)
+    ,B = initial.shape.parm * runif(length(initial.shape.parm), 0.95,1.05)
+  )
+}
+
+set.seed(1922)
+n.chains <- 4
+init.ll <- lapply(1:n.chains, function(chain.id) init.fun(chain.id))
+
+## This is very slow
+if(!file.exists("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/stan-fit-pib-tau-wmh.rda")){
+stan.fit <- stan(model_code=smc, 
+                 data=stan.list,
+                 pars = c("B","betaX1","atau","sigma","alpha","Omega"),
+                 iter=2000,
+                 init=init.ll,
+                 thin=1,
+                 seed=1922,
+                 chains=4,
+                 cores=4,
+                 control=list(max_treedepth=15, adapt_delta=0.95)) ## same as rstanarm default
+  ## too big to save out to consult directory. saved to bigdata
+  save(stan.fit, file="/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/stan-fit-pib-tau-wmh.rda")
+} else load("/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/stan-fit-pib-tau-wmh.rda")
+```
+
+## Check posterior summary statistics and convergence diagnostics
+
+There is good documentation of the diagnostic plots for 
+Rstan here https://mc-stan.org/rstan/articles/index.html
+
+Here are a few things worth checking, but this is certainly not exhaustive.
+
+ - runtime
+ - Rhat
+ - divergent transitions
+ - log likelihood per chain
+ - random sample of per-subject trajectories per chain
+ - mean curves per chain
+
+```{r rstanconvergence, fig.height=2.5}
+
+###############################
+## Verify initial values were used
+## Stan often does not throw a warning if something went wrong and 
+## initial values were not used.
+str(stan.fit@inits[[1]])
+str(init.ll[[1]])
+
+###############################
+## Runtime, in hours
+rowSums(get_elapsed_time(stan.fit))/60/60
+
+###############################
+## Get parameter summaries of stan model (ssm)
+ssm <- summary(stan.fit)
+## List of parameter names
+nms <- rownames(ssm[[1]])
+```
+
+```{r, include=F, eval=F}
+###############################
+## Quick plots to review estimates
+
+## This is useful for amyloid PET because these models are well understood
+## so I have a good feeling for what these values should be.
+## I am not sure these plots will be as useful for an unfamiliar measures?
+plot(stan.fit, pars='B')      ## expect c(0.37, 0.05, 0.33, 0.04)
+plot(stan.fit, pars='betaX1')   ## expect c(-1, -0.15, 0.4, 0.03)
+plot(stan.fit, pars=grep('^alpha',nms,value=T)[1:10])  ## print the first 10 alphas, btwn -2 to 2 is ok
+plot(stan.fit, pars='sigma')  ## expect between 0.01 and 0.3
+plot(stan.fit, pars='atau')   ## expect between 0.7 and 1.0
+```
+
+
+```{r}
+
+###############################
+## Review Rhat
+
+table(cut(ssm[[1]][,'Rhat'], breaks=c(0.9,1,1.05,1.2,2,100)), useNA='always')
+
+myvars <- c(1,4,8:10)
+
+## best Rhats
+as.data.frame(ssm[[1]]) %>% arrange(Rhat) %>% select(all_of(myvars)) %>% head(20)
+
+## worst Rhats
+as.data.frame(ssm[[1]]) %>% arrange(desc(Rhat)) %>% select(all_of(myvars)) %>% head(20)
+
+```
+
+In a model that has converged, we want all <1.05 for a really good fit.
+I would be OK assessing a model where some of the alphas were >1.05, 
+but for publication all should be <1.05.
+
+```{r, include=F,eval=T}
+
+# - divergent transitions - Possible future work.
+# 
+```
+
+```{r, fig.height=2.5}
+###############################
+# Review log lik per chain
+
+ll <- ssm[[2]]["lp__",c('50%','2.5%','97.5%'),]
+
+round(ll)
+
+t(ll) %>%
+  as.data.frame %>%
+  rownames_to_column(var='chains') %>%
+  ggplot(aes(y=chains, x=`50%`, xmin=`2.5%`, xmax=`97.5%`)) +
+  geom_pointrange(size=1, color='blue', fill='white', shape=22)
+```
+
+The log likelihood is similar in each chain, this supports that all chains have converged
+to the same solution.
+
+```{r}
+###############################
+## To compare the predictions from each chain
+## review a set of curves for each chain
+
+## Have all four chains arrived at the same place?
+## Have the iterations in each chain arrived at the same place?
+
+hyper <- function(B, age) {
+  ## To plot the mean curve, must match the hyper
+  ## as it was called in stan
+  ## So no intercept term is needed
+  z <- (age - 75)/10
+  yhat <-  B[1] + B[2]*z + .5*(B[3]-B[2])*(z + sqrt(z^2 + B[4]^2))
+  return(yhat)
+}
+
+n.outcome <- 3 ## three outcomes
+n.ipc <- stan.fit@sim$iter - stan.fit@sim$warmup  ## number iterations per chain
+n.chain <- stan.fit@sim$chains   ## number of chains
+n.iters <- n.ipc*n.chain
+n.ppl <- stan.list$M
+
+temp <- rstan::extract(stan.fit, pars=c("B"), permuted=FALSE, inc_warmup=F)
+## sanity check...most useful for multiple outcomes
+array(dimnames(temp)[[3]], dim=c(4, n.outcome))
+## Rearrange dimensions to (iteration#, chain#, outcome, ___ )
+## one dimension of temp will be the number of parameters
+## In this case the four B parameters
+
+BB <- array(temp, dim=c(n.ipc, n.chain, 4, n.outcome))
+
+# a sampling of fits, for plotting
+ii <- floor(seq(1,n.ipc,length.out=30)) 
+
+xage <- 50:110
+
+par(mfrow=c(2,2), mar=c(5,5,1,1),las=1)
+
+ypib <- array(0, dim=c(length(xage), length(ii), n.chain))
+for (chain in 1:n.chain)
+  ypib[,,chain] <- sapply(ii, function(i) hyper(BB[i, chain,,1], xage))
+
+for (i in 1:n.chain) {
+  matplot(xage, exp(ypib[,,i]), type='l', log='y',
+          xlab="Age", ylab = paste("Pib", i))
+  grid()
+}
+
+ytau <- array(0, dim=c(length(xage), length(ii), n.chain))
+for (chain in 1:n.chain)
+  ytau[,,chain] <- sapply(ii, function(i) hyper(BB[i, chain,,2], xage))
+
+for (i in 1:n.chain) {
+  matplot(xage, exp(ytau[,,i]), type='l', log='y',
+          xlab="Age", ylab = paste("tau", i))
+  grid()
+}
+
+ywmh <- array(0, dim=c(length(xage), length(ii), n.chain))
+for (chain in 1:n.chain)
+  ywmh[,,chain] <- sapply(ii, function(i) hyper(BB[i, chain,,3], xage))
+
+for (i in 1:n.chain) {
+  matplot(xage, ywmh[,,i]*5, type='l', 
+          xlab="Age", ylab = paste("wmh", i))
+  grid()
+}
+
+
+
+```
+
+In a sample of 30, the curves are all nearly on top of each other. This is what we 
+would expect from a model that has converged.
+
+
+```{r}
+###############################
+## Plot mean curve per chain
+
+## Might be easier to assess whether all four chains arrived at 
+## the same mean curve than looking at curves from random sample iterations
+
+xage <- 50:110
+y1 <- array(0, dim=c(length(xage), n.ipc, n.chain))
+for (chain in 1:n.chain)
+  y1[,,chain] <- sapply(1:n.ipc, function(i) hyper(BB[i, chain,,1], xage))
+y1 <- apply(y1, c(1,3), mean)
+
+y2 <- array(0, dim=c(length(xage), n.ipc, n.chain))
+for (chain in 1:n.chain)
+  y2[,,chain] <- sapply(1:n.ipc, function(i) hyper(BB[i, chain,,2], xage))
+y2 <- apply(y2, c(1,3), mean)
+
+y3 <- array(0, dim=c(length(xage), n.ipc, n.chain))
+for (chain in 1:n.chain)
+  y3[,,chain] <- sapply(1:n.ipc, function(i) hyper(BB[i, chain,,3], xage))
+y3 <- apply(y3, c(1,3), mean)
+
+par(mfrow=c(2,2))
+matplot(xage, y1, type='l')
+matplot(xage, y2, type='l')
+matplot(xage, y3, type='l')
+```
+
+All chains are nearly identical and plotted on top of each other.
+This model has converged.
+
+Recall that the curves based on the per-chain means may differ
+from each other if the model has not converged. The overall
+mean model will be an average of the chains, so the overall
+curve would likely look different from the per-chain curves
+in the situation where we have not reached convergence.
+
+
+
+
+# Review individual random effects (alphas)
+
+Individual random effects are per-person per-outcome left-right shifts 
+on the age scale denoted by alpha.  Thus alpha_{11} would be the estimated
+value of the random effect for the person `1` and outcome `1`.
+
+Because this is a Bayesian model, we want to extract the
+estimated random effect for each person by outcome.  And then we would
+like to look at the pairwise scatterplots. This will help us get 
+a sense of whether subjects who tend to have earlier amyloid deposition,
+also tend to have earlier tau deposition.
+
+
+```{r extractalphas}
+
+
+alphas <- ssm$summary[grep('alpha',nms,value=T),] %>%
+  data.frame() %>%
+  ## mult by 10 to convert to years, not decades
+  mutate(across(everything(),~.*10)) %>%
+  rownames_to_column() %>%
+  separate(rowname, into=c('term','id','outcome')) %>%
+  mutate(outcome = factor(outcome, levels=1:3, labels=c('pib','tau','wmh')),
+         id = as.numeric(id)) 
+head(alphas)
+
+## plotting dataset
+pdat <- select(alphas, id, outcome, mean) %>%
+  pivot_wider(names_from=outcome, values_from=mean, names_prefix='alpha.') %>%
+  ## Set some alphas to missing
+  ## All ppt get an estimated alpha, regardless of having data for that outcome
+  ## We do not want to look at alphas for ppts w/o observed values of the outcome
+  ## merge in number of scans per person, and blank if 0
+  left_join(filter(d, !duplicated(id)) %>% select(id, npib, ntau, nwmh)) %>%
+  mutate(alpha.pib = ifelse(npib == 0,NA,alpha.pib),
+         alpha.tau = ifelse(ntau == 0,NA,alpha.tau),
+         alpha.wmh = ifelse(nwmh == 0,NA,alpha.wmh))
+
+pdat  
+
+GGally::ggpairs(select(pdat, contains('alpha')), 
+                upper  = list(continuous = "blank"))
+
+```
+	
+
+```{r extract-all-iterations}
+## For some of the computations in the following sections, 
+## we will need all parameters from all iterations
+
+## Get all iterations
+B.all <- rstan::extract(stan.fit, pars="B")[[1]]
+beta.all <- rstan::extract(stan.fit, pars="betaX1")[[1]]
+alpha.all <- rstan::extract(stan.fit, pars="alpha")[[1]]
+omega.all <- rstan::extract(stan.fit, pars="Omega")[[1]]
+sigma.all <- rstan::extract(stan.fit, pars='sigma')[[1]]
+alpha.sd.all <- rstan::extract(stan.fit, pars='atau')[[1]]
+```
+
+# Covariance of individual effects for WMH given pib and tau
+
+We want the distribution of alpha[i,wmh] | alpha[i,PiB], alpha[i,TauPET].
+
+<!-- To compute this, we will need -->
+
+<!-- conditional mean of alpha[i, wmh] -->
+<!-- conditional variance of alpha[i, wmh] -->
+<!-- marginal variance of alpha[i,wmh] -->
+<!-- proportion of variance explained by alpha[i,wmh] -->
+
+Computations must occur per-iteration before averaging.
+
+```{r }
+## Build Sigma, for each iteration, the variance-covariance matrix for three alphas
+vcov.all <- array(0, dim = dim(omega.all))
+for(i in 1:n.iters) {
+  sd1 <- alpha.sd.all[i,1]
+  sd2 <- alpha.sd.all[i,2]
+  sd3 <- alpha.sd.all[i,3]
+  cor12 <- omega.all[i,1,2]
+  cor13 <- omega.all[i,1,3]
+  cor23 <- omega.all[i,2,3]
+  cov12 <- cor12 * sd1 * sd2
+  cov13 <- cor13 * sd1 * sd3
+  cov23 <- cor23 * sd2 * sd3
+  vcov.all[i,,] <- rbind(c(sd1^2, cov12, cov13),
+                         c(cov12, sd2^2, cov23),
+                         c(cov13, cov23, sd3^2))
+}
+
+# 
+# ###############################
+# ## Sanity check of var-covar matrix 
+# ## code by Stephen Weigand
+# ###############################
+# mat <- as.matrix(stan.fit)
+# mat.use <- mat[, c(grep("Omega", colnames(mat), value = TRUE),
+#                    grep("atau", colnames(mat), value = TRUE))]
+# # mat <- rstan::extract(stan.fit, permuted = F)
+# 
+# ## Build up the variance covariance matrix of three alphas
+# build.Sigma <- function(params, which.vars = 1:3) {
+#     sd1 <- params[sprintf("atau[%d]", which.vars[1])]
+#     sd2 <- params[sprintf("atau[%d]", which.vars[2])]
+#     sd3 <- params[sprintf("atau[%d]", which.vars[3])]
+#     cor12 <- params[sprintf("Omega[%d,%d]", which.vars[1], which.vars[2])]
+#     cor13 <- params[sprintf("Omega[%d,%d]", which.vars[1], which.vars[3])]
+#     cor23 <- params[sprintf("Omega[%d,%d]", which.vars[2], which.vars[3])]
+#     cov12 <- cor12 * sd1 * sd2
+#     cov13 <- cor13 * sd1 * sd3
+#     cov23 <- cor23 * sd2 * sd3
+#     rbind(c(sd1^2, cov12, cov13),
+#           c(cov12, sd2^2, cov23),
+#           c(cov13, cov23, sd3^2))
+# }
+# 
+# ## not even the first iteration matches. blech.
+# i <- 1
+# vcov.all[i,,]
+# build.Sigma(mat.use[i, ], which.vars = 1:3)
+# alpha.sd.all[i,]
+# nm <- c("atau[1]","atau[2]","atau[3]")
+# mat.use[i,nm]
+# 
+# 
+# # NOTE: iterations are numbered differently when useing as.matrix() vs extract()
+# # so hard to check his vs mine. annoying.
+# 
+# # as.matrix(stan.fit)[1:2, nm]
+# # rstan::extract(stan.fit, permuted = F)[1,,nm]
+# # rstan::extract(stan.fit, permuted = T)$atau[1:2,]
+# # rstan::extract(stan.fit, pars='atau')$atau[1:2,]
+# # rstan::extract(stan.fit, pars='atau',permuted=FALSE)[1:2,1:4,1:3]
+# # rstan::extract(stan.fit, pars='atau',permuted=TRUE)$atau[1:2,]
+# # rstan::extract(stan.fit, pars='atau',permuted=TRUE)$atau[1001:1002,]
+# # rstan::extract(stan.fit, pars='atau',permuted=TRUE)$atau[2001:2002,]
+# # rstan::extract(stan.fit, pars='atau',permuted=TRUE)$atau[3001:3002,]
+
+```
+
+
+<!-- Then to get a proportion of variance explained in α[i, wmh] by PiB and TauPET, does one use the conditional variance of α[i, wmh] -->
+<!-- .... -->
+<!-- marginal -->
+
+<!-- ```{r weigand} -->
+<!-- ## compute the proportion of variance for each iteration -->
+<!-- ``` -->
+
+I think we can compute the conditional variance of WMH given pib and tau
+from the 3x3 variance-covariance matrix.  
+We will need to use the Schur complement to do this.
+
+```{r}
+## compute the conditional variance of alpha wmh given pib and tau
+
+###############################
+## For a single iteration
+###############################
+
+i <- 7
+
+## 1. partition the covariance matrix into blocks
+
+## covariance matrix of pib and tau
+(Sigma11 <- vcov.all[i,1:2,1:2])
+
+## cross-covariances
+(Sigma12 <- c(vcov.all[i,1,3], vcov.all[i,2,3]))
+(Sigma21 <- rev(Sigma12))
+
+## variance of wmh, unconditional
+(Sigma22 <- vcov.all[i,3,3])
+
+## sanity check...should be same
+Sigma22; alpha.sd.all[i,3]^2
+
+## 2. compute the conditional variance of wmh given pib and tau
+(conditional_variance <- Sigma22 - Sigma12 %*% solve(Sigma11) %*% Sigma21)
+
+## 3. R^2, percent variation explained
+
+## R^2 is conditional variance of alpha wmh / divided by the marginal variance of alpha wmh
+## R^2 is the proportion of conditional var div by total var of y
+1 - conditional_variance / Sigma22
+(1 - conditional_variance / Sigma22) * 100
+```
+
+The conditional correlation is weak, as is expected.  WMH was not strongly correlated to either of PiB nor tau, so we expected a weak correlation of WMH|PiB,Tau
+
+```{r}
+###############################
+## For each iteration
+###############################
+
+rsq <- rep(0, n.iters) 
+pve <- rep(0, n.iters)
+for(i in 1:n.iters){
+  Sigma11 <- vcov.all[i,1:2,1:2]
+  Sigma12 <- vcov.all[i,1:2,3]
+  Sigma22 <- vcov.all[i,3,3]
+  .cv <- Sigma22 - rev(Sigma12) %*% solve(Sigma11) %*% Sigma12
+  rsq[i] <- 1 - .cv / Sigma22
+  pve[i] <- (1 - .cv / Sigma22) * 100
+}
+
+summary(rsq)
+summary(pve)
+
+hist(rsq)
+```
+
+
+# Proportion over threshold
+
+
+<!-- PIB and tau are well summarized by a hyperbola because the corner is fairly tight. -->
+<!-- However, other measures like WMH% the curve is much less tight appearing log-linear -->
+<!-- or linear like FA.  Similar to the latter, plasma p-tau 181 does not have a sharp -->
+<!-- change point. -->
+
+<!-- Hence, the summary metrics of change point, slope prior to change point, and slope -->
+<!-- after change point may be too simple to accurately describe a wider variety of shapes. -->
+
+<!-- An alternate definition is to plot the expected fraction who will have -->
+<!-- crossed a specified threshold by each age, as predicted by the fitted model. -->
+<!-- This removes the hypothetical mean time out of our field of vision, and may lessen confusion. -->
+<!-- This is summarized in the curves below. -->
+
+
+<!-- NOTES: -->
+<!-- The proportions currently are based on the full sample -->
+<!-- which means these are predicted proportions where we ignore -->
+<!-- whether or not a subject ever had C2N run, for example. -->
+<!-- This might be OK for this study, but might not for the next. -->
+
+<!-- Each study will need to think about the most -->
+<!-- appropriate curves to display given the -->
+<!-- questions they are trying to answer. -->
+<!-- e.g. perhaps we would want to estimate separately -->
+<!-- by APOE genotype, or by sex, and so on. -->
+
+<!-- CAUTION: when sample combines ADRC and MCSA, you should -->
+<!-- estimate proportions for MCSA only, and might not find ADRC to -->
+<!-- be informative to anyone outside of ADRC-MN, -->
+<!-- since that is a referral-based study. -->
+
+*Cut points*
+
+There are different approaches for selecting cut-points for each measure. 
+Here are a few ides:
+
+1. Published or established cut-points
+2. Young normal mean+kSD: Use distribution of the outcome from a
+young-normal MCSA sample that has all outcomes measures of interest.
+Cut-point computed as mean + kSD from the normals. 
+3. Mixture modeling: extract the mean and SD from 'normal/healthy' 
+cluster using mixture modeling. Cut-point computed as mean + kSD
+from the normals. 
+
+For this report, use:
+
+ - Abnormal amyloid PET meta-ROI (PIB_CENTILOID >= 25 or PIB_SUVR >= 1.52)
+ - Abnormal tau PET meta-ROI (TAU_SUVR ≥ 1.29) 
+ - Abnormal Schwarz GE WMH% (WMHPCTTIV >= 1.62)
+ 
+This model was fit on simulated data.  
+The raw data was estimated using Schwarz WMH algorithm
+and GE-only scans. So this may be an older cut-point, but that seems OK.
+
+```{r include=F, eval=F}
+suvr.to.centiloid <- function(suvr) {(100 * ((-0.1620 + 0.9467 * suvr) - 1.009) / 1.067) }
+centiloid.to.suvr <- function(cent) { ((((cent/100)*1.067) + 1.009) + 0.1620)/0.9467 }
+
+## sanity check
+centiloid.to.suvr(suvr.to.centiloid(seq(1,3.5, by=0.5)))
+centiloid.to.suvr(25)
+
+```
+
+## CDF of offsets
+
+The "CDF of offsets method" is computationally faster
+to compute proportion over threshold curves vs CDF of outcome (formerly brute-force).
+
+Terry came up with this idea that makes use of the CDF 
+of the offsets.
+
+This method will work for outcomes with left-right shifts and covariates.
+This method will NOT work for outcomes additionally having up-down shifts and covariates. (e.g. cognition)
+
+We will need to eventually do this computation for all iterations,
+and on all people, but the way this code works can be opaque to me. 
+
+### Example for amyloid and a single iteration
+
+To understand it better, start by walking through the steps
+on just amyloid and for a single iteration.
+
+1. Get age at which cut-point crosses target curve
+
+Convert cut-point to age-scale using the overall mean curve.
+
+```{r }
+## A set of ages was defined above
+## centered and scaled to match the data passed to the model
+xage.sc <- (xage-75)/10
+
+## amyloid-pet SUVR cut-point, on log-scale
+cut.pib <- log(1.52)
+
+## the mean estimated B parameters that define the shape of they amyloid-PET hyperbola
+B.pib.mean <- c(0.3700, 0.0424, 0.3276, 0.0664)
+
+## Exponentiation to undo log-scale
+## predictions at each year of age
+## approx converts to age-scale cut-point
+.ycut.pib <- approx(hyper(B.pib.mean, xage), xage.sc, cut.pib)$y
+```
+
+.ycut corresponds to 1.52 SUVR.
+
+Since this is relative to the target curve, I suppose this is the
+"adjusted amyloid age cut-point".
+
+.ycut is centered and scaled, as age was in the model.
+Convert to age in years: `r .ycut.pib * 10 + 75`
+
+
+2. Get linear predictor 'covar adj offsets' as matrix
+for a single iteration.
+
+```{r }
+## Matrix of covariate values, one row per person
+aX <- stan.list$X[!duplicated(stan.list$id),] 
+
+beta.pib1 <- beta.all[1,,1]
+alpha.pib1 <- alpha.all[1,,1]
+offset.pib1 <- aX %*% beta.pib1 + alpha.pib1
+```
+
+
+3. Compute a set of x (age) and y (proportion) values
+which can be used to produce a curve of the
+predicted proportion over a given threshold
+at each age
+
+Let offset = aX * beta + alpha = covar adjusted offset.
+Then anyone for whom age + offset > .ycut will be above the 1.52 line (.ycut).
+
+At a target age of x, then, all subjects with x+offset > ycut, or
+x > ycut - offset, will be predicted to progress.
+
+If 20% of the offsets are > 15y, say, then 20% of the subjects are
+predicted to progress by age ycut-15y.
+Now apply the CDF for offset, which is the proportion
+in the population having up to but not more than the given value.
+This is the inverse of what we ultimately want to plot.
+
+```{r fig.cap='.'}
+## Set of desired proportions
+yy <- 0:100/100
+
+## Summarize the distribution of the "covariate adjusted offsets"
+offset.pib.cdf1 <- quantile(offset.pib1, yy)
+
+## Then subtract to convert to the age-scale
+## This gets us a set of ages corresponding the proportions
+xx <- .ycut.pib - offset.pib.cdf1
+
+## Plot the proportion over threshold for pib
+## Quantile gives proportion below
+## but we want proportion above, hence 1-yy
+## Converge to age in years before plotting
+par(mfrow=c(1,1))
+plot(xx*10+75, (1-yy), xlab='Age, y', ylab='Proportion over threshold', main = 'PiB, fast method, for first iteration')
+```
+
+
+**As a check**, compute the adjusted amyloid age using offset and current age.
+
+```{r }
+###############################
+## offset + current age = adj pib age = eta
+adj.pib.age <- (offset.pib1[stan.list$id] + stan.list$age)[stan.list$outcome==1]*10+75
+summary(adj.pib.age)
+```
+
+**Interpretation of the proportion:**
+
+```{r,echo=T}
+(pp <- sum(((70-75)/10 + offset.pib1) > .ycut.pib)/length(offset.pib1) * 100)
+```
+
+Assuming everyone in our sample lived to age 70, then we would
+expect `r pp`% of those subjects would have abnormal amyloid,
+for the first iteration.
+
+
+```{r,echo=T}
+(pp <- sum(((80-75)/10 + offset.pib1) > .ycut.pib)/length(offset.pib1) * 100)
+```
+
+Assuming everyone in our sample lived to age 80, then we would
+expect that `r pp`% of those subjects would have abnormal amyloid.
+
+*Tip:* Consider for each outcome the direction of abnormality, and how that 
+impacts the calculations.
+High is abnormal for PiB, but low is abnormal for cognition or abeta ratio.
+
+### All iterations and outcomes
+
+Now, let's apply this method over all iterations, and all outcomes.
+
+```{r, fig.cap='.'}
+## Above, we already have defined most of what we need:
+## beta.all: estimated covariate effects for each iteration and outcome
+## alpha.all: individual adjustments for all iterations, ppl, and outcomes
+## aX: matrix of per-subject covariate values
+## yy: vector of proportions of interest
+
+##  .ycut for each outcome:
+B.mean <- apply(B.all, 2:3, mean)
+.ycut <- c(approx(hyper(B.mean[,1], xage), xage.sc, log(1.52))$y,
+           approx(hyper(B.mean[,2], xage), xage.sc, log(1.29))$y,
+           approx(hyper(B.mean[,3], xage), xage.sc, 1.62/5)$y)           
+
+## empty matrix for predicted ages
+xx.all <- array(0, dim = c(n.iters, n.outcome, length(yy)),
+                 dimnames = list('iteration'=1:n.iters, 
+                                 'outcome'=1:n.outcome,
+                                 'prop'=1:length(yy)))
+for(i in 1:n.iters) {
+  for(o in 1:n.outcome) {
+    ## 'covariate adjusted left-right offset'
+    .offset <- alpha.all[i,,o] + aX %*% beta.all[i,,o]
+    ## Summarize the distribution of offsets
+    .cdf <- quantile(.offset, yy)
+    ## subtract to get a set of ages (in decades)
+    ## corresponding the proportions
+    xx.all[i,o,] <- .ycut[o] - .cdf
+  }}
+
+xx.pib.mean <- apply(xx.all[,1,], 2, mean)
+xx.tau.mean <- apply(xx.all[,2,], 2, mean)
+xx.wmh.mean <- apply(xx.all[,3,], 2, mean)
+
+.p <- c(0.5,0.025,0.975)
+xx.pib.ci <- apply(xx.all[,1,], 2, quantile, probs=.p)
+xx.tau.ci <- apply(xx.all[,2,], 2, quantile, probs=.p)
+xx.wmh.ci <- apply(xx.all[,3,], 2, quantile, probs=.p)
+
+## Plot the proportion over threshold for pib
+## Quantile gives proportion below
+## but we want proportion above, hence 1-yy
+## Converge to age in years before plotting
+matplot(cbind(xx.pib.mean, xx.tau.mean, xx.wmh.mean)*10+75, 
+        (1-yy)*100, type='l', ylim=c(0,100),
+        xlab='Age, y', ylab='Proportion over threshold', main = 'CDF offset method')
+legend('topleft',lty=1:3,col=1:3,legend=c('pib','tau','wmh'))
+```
+
+
+## Compute yhat for a set of ages, the CDF of outcomes method
+
+For outcomes like cognition with up-down covariates or individual
+adjustments, I don't think we can use the computationally faster method.
+
+Show how to do this computation without using the "CDF of the offsets" trick above.
+
+There may be a smarter way to program this.  But my approach was to
+compute yhat for each iteration, each subjects, for each potential age.
+
+An update was made on 04/2025 to the program, to add epsilon(e_ij) after
+evaluating the `hyper()` function. In the offset-CDF method, we can ignore 
+this residual noise, or measurement error. But in the outcome-CDF method, 
+which is meant to mimic the full data-generating process more closely, 
+it's correct (and important) to add the epsilon back.
+
+ 
+```{r }
+## Get predicted yhat for all iterations, all subjects, and a set of ages for each person.
+## This will be a very large object.
+
+## Because this section can be slow; load summaries of the yhats
+## Only run the first few computations below when
+## this file does not exist.
+.f <- "/bigdata/bsi/neuro/s101846.adir/working/lundt/tutorials/summaries-of-outcome-CDF-pct-abnormal-pib-tau-wmh.rda"
+if(file.exists(.f)) {
+  load(.f)
+  } else {
+  ###############################
+  # 1. compute offset per iteration, per person, per outcome
+  
+  ## Calculate linear predictor 'covariate adjusted left-right offset'
+  ## in decades
+  ## (per iter, per person, per outcome)
+  offset.all <- array(0, dim = c(n.iters, n.ppl, n.outcome),
+                   dimnames = list('iteration'=1:n.iters, 
+                                   'id'=1:n.ppl, 
+                                   'outcome'=1:n.outcome))
+  for(i in 1:n.iters) {
+    for(o in 1:3) {
+      offset.all[i,,o] <- alpha.all[i,,o] + aX[,] %*% beta.all[i,,o]
+    }}
+  
+  ###############################
+  # 2. compute eta = offset + each age of interest
+  
+  ## Add a 4th dimension for ages
+  eta.all <- array(0, dim = c(n.iters, n.ppl, n.outcome, length(xage)),
+                   dimnames = list('iteration'=1:n.iters, 
+                                   'id'=1:n.ppl, 
+                                   'outcome'=1:n.outcome,
+                                   'age'=1:length(xage)))
+  for(a in 1:length(xage)) {
+    eta.all[,,,a] <- offset.all + xage.sc[a]
+  }
+  
+  ###############################
+  # 3. get predicted outcome, yhat
+  set.seed(310)
+  yhat.all <- array(0, dim = c(n.iters, n.ppl, n.outcome, length(xage)),
+                   dimnames = list('iteration'=1:n.iters, 
+                                   'id'=1:n.ppl, 
+                                   'outcome'=1:n.outcome,
+                                   'age'=1:length(xage)))
+  for(i in 1:n.iters){
+    for(o in 1:n.outcome){
+      for(a in 1:length(xage)) {
+        yhat.all[i,,o,a] <- hyper(B = B.all[i,,o], 
+                                  ## Recall, set up to accept age in years
+                                  age = eta.all[i,,o,a]*10+75 ) +
+          ## 20250423 - add measurement error
+          ## Take a random draw from N(0, sigma-per-iteration)
+          ## since we average over all people, it should be OK that
+          ## we are not taking the specific epsilon per-person which
+          ## technically was estimated, but not saved out.
+          rnorm(n=n.ppl, mean=0, sd = sigma.all[i,o])
+      }}}
+
+  ###############################
+  # 4. for each outcome, summarize proportion over cut-point per iteration and at each age
+  
+  pct.ab.pib.all <- apply(yhat.all[,,1,] > log(1.52), c(1,3), sum)/n.ppl*100
+  pct.ab.pib.mean <- apply(pct.ab.pib.all, 2, mean)
+  
+  pct.ab.tau.all <- apply(yhat.all[,,2,] > log(1.29), c(1,3), sum)/n.ppl*100
+  pct.ab.tau.mean <- apply(pct.ab.tau.all, 2, mean)
+  
+  pct.ab.wmh.all <- apply(yhat.all[,,3,] > 1.62/5, c(1,3), sum)/n.ppl*100
+  pct.ab.wmh.mean <- apply(pct.ab.wmh.all, 2, mean)
+  
+  
+  ###############################
+  # 5. for each outcome, summarize quantiles at each age (median, credible interval)
+  .p <- c(0.5, 0.025, 0.975)
+  pct.ab.pib.ci <- apply(pct.ab.pib.all, 2, quantile, probs = .p)
+  
+  # ## sanity check...mean and median should be similar
+  # summary(pct.ab.pib.mean)
+  # summary(pct.ab.pib.ci['50%',])
+  # 
+  # summary(pct.ab.pib.ci['2.5%',])
+  # summary(pct.ab.pib.ci['97.5%',])
+  
+  pct.ab.tau.ci <- apply(pct.ab.tau.all, 2, quantile, probs = .p)
+  
+  pct.ab.wmh.ci <- apply(pct.ab.wmh.all, 2, quantile, probs = .p)
+  
+  ## Save the percent abnormal summaries
+  save(pct.ab.pib.mean, pct.ab.pib.ci,
+       pct.ab.tau.mean, pct.ab.tau.ci,
+       pct.ab.wmh.mean, pct.ab.wmh.ci,
+       file = .f)
+
+}
+```
+
+Show all outcomes together
+
+```{r, fig.cap='.'}
+matplot(y = cbind(pct.ab.pib.mean, pct.ab.tau.mean, pct.ab.wmh.mean), 
+        x = xage, type = 'l', main='CDF of outcome', ylim=c(0,100),
+        xlab = 'Age, years', ylab = '%abnormal')
+legend('topleft',lty=1:3,col=1:3,legend=c('pib','tau','wmh'))
+```
+
+## Compare methods
+
+We expect the methods to be quite similar, if not identical.
+
+```{r fig.cap='.'}
+## CDF of outcome colors per pib, tau, wmh
+.colb <- c('gray70','pink','lightgreen')
+
+## CDF of offset colors per pib, tau, wmh
+.colc <- c('black','red','darkgreen')
+
+matplot(y = cbind(pct.ab.pib.mean, pct.ab.tau.mean, pct.ab.wmh.mean), 
+        x = xage, type = 'l', ylim=c(0,100),
+        xlab = 'Age, years', ylab = '%abnormal',
+        main = 'Mean curves by method',
+        lwd=6, col= .colb)
+matlines(y = (1-yy)*100,
+         x = cbind(xx.pib.mean, xx.tau.mean, xx.wmh.mean)*10+75, col=.colc)
+legend('topleft',lty=1:3,col=.colc,legend=c('pib','tau','wmh'), title='CDF of offset method')
+legend('left',lty=1:3,col=.colb,legend=c('pib','tau','wmh'),lwd=6, title='CDF of outcome method')
+
+```
+
+
+For tau, the estimated proportions do not appear identical at all ages.
+Take age 80, the proportion by the CDF of offset method is slightly less vs
+outcome.  That's interesting and might be worth having a PhD think about
+this more.  
+But, these are similar enough that I am OK with reporting the results
+using either computational method. 
+
+```{r fig.height=8, fig.cap='.'}
+par(mfrow=c(2,2), oma=c(0,0,1,0))
+matplot(y = t(pct.ab.pib.ci),
+        x = xage, type = 'l', ylim=c(0,100),
+        xlab = 'Age, years', ylab = '%abnormal', main='PiB',
+        lwd=c(6,3,3), col= .colb[1], lty = c(1,1,1))
+matlines(y = (1-yy)*100,
+         x = t(xx.pib.ci)*10+75,
+         lwd=1, col= .colc[1], lty = c(1,1,1))
+mtext(text = 'Median curves with 95% credible interval by method',
+      side=3,line=0,outer=TRUE,font=2)
+legend('topleft',lwd=c(1,6),lty=1,col=c(.colc[1], .colb[1]),
+       legend=c('CDF offset','CDF outcome'))
+        
+matplot(y = t(pct.ab.tau.ci),
+        x = xage, type = 'l', ylim=c(0,100),
+        xlab = 'Age, years', ylab = '%abnormal', main = 'Tau',
+        lwd=c(6,3,3), col= .colb[2], lty = 1)
+matlines(y = (1-yy)*100,
+         x = t(xx.tau.ci)*10+75,
+         lwd=1, col= .colc[2], lty = 1)
+legend('topleft',lwd=c(1,6),lty=1,col=c(.colc[2],.colb[2]),
+       legend=c('CDF offset','CDF outcome'))
+        
+
+matplot(y = t(pct.ab.wmh.ci),
+        x = xage, type = 'l', ylim=c(0,100),
+        xlab = 'Age, years', ylab = '%abnormal', 
+        main = 'WMH',
+        lwd=c(6,3,3), col= .colb[3], lty = c(3,1,1))
+matlines(y = (1-yy)*100,
+         x = t(xx.wmh.ci)*10+75,
+         lwd=1, col= .colc[3], lty = 1)
+legend('topleft',lwd=c(1,6),lty=1,col=c(.colc[3],.colb[3]),
+       legend=c('CDF offset','CDF outcome'))
+
+```
+
+The median by method are nearly identical, even for tau, which is unlike the means.
+
+The 95% credible intervals differ between methods, and most notably for tau PET.
+
+Is it possible that the offset CDF method works OK for finding the mean and/or median curve, but cannot be used to compute a CI?  Or is there something else going on here?
+
+<!-- future idea: add a subsection for prop curves on cognition -->
+
+<!-- future idea: we could save ourselves a headache, if we just saved yhat as 
+part of the model output. nope! that wouldn't work because currently we get 
+proportions pretending that people never die.  if they lived forever, this would 
+be their future. -->
+
+## Standard errors for the difference between curves
+
+<!-- Source code written by Terry Therneau as part of
+Petrice Cogswell's R01 grant attempt:
+ /projects/bsi/neuro/s101846.adir/Cogswell/R01-temporal-evolution-2023/esl
+ compute-diff-btwn-curves.R -->
+
+The difference between proportion over threshold curves is 
+rooted in the choice of cut-point values.
+
+In grants, we may want to use the mean time between PIB and ptau as a measure.
+A classic statistics theorem is that for any positive random variable, 
+mu = S(t) where S is the survival function.  
+This means that the mean time between PIB and ptau, for instance, is simply
+the difference in the AUC of the two prevalence curves. 
+
+More simply, given that the curves the offset CDF method above are the 
+empirical CDF of the random variable 
+ycut - offset, we can simply take mean of that variable.
+
+For credible intervals, recompute that mean for all of the draws from the 
+MCMC chain.  For that we need all the alpha, beta, and B values. 
+
+In this example, compare PiB with cut point 1.52 and tau with cut point 1.29.
+
+
+```{r }
+## Things we need that were already defined above:
+# n.iters
+# alpha.all
+# beta.all
+# B.all
+# ages  ##  50 to 100
+# aX
+
+## Need lower ages ('l' ages), so no NAs in computation:
+lages <- 40:100
+
+## define empty container to hold the output
+## second dimension is 2, for the two outcomes being compared
+## (pib and tau), we will take difference of these
+.ycut <- matrix(0, n.iters, 2) 
+.cmean <- matrix(0, n.iters, 2)
+
+## compare pib and tau only
+for (i in 1:n.iters) {
+    .offset <- aX %*% beta.all[i,,] + alpha.all[i,,]
+    ## units of offset and ycut MUST be per-decade
+    .ycut[i,1] <- approx(hyper(B.all[i,,1], lages), lages/10, log(1.52))$y
+    .ycut[i,2] <- approx(hyper(B.all[i,,2], lages), lages/10, log(1.29))$y
+    ## convert back to years, mult by 10
+    .cmean[i,1] <- mean(.ycut[i,1] - .offset[, 1])*10
+    .cmean[i,2] <- mean(.ycut[i,2] - .offset[, 2])*10
+}
+
+c("mean tau age"= mean(.cmean[,2]), 
+  "mean pib age"= mean(.cmean[,1]),
+  "delta" = diff(colMeans(.cmean)), 
+  se= sd(.cmean[,2]-.cmean[,1]))
+```
+
+We could modify in a way that we could compute any two pairs of curves,
+and then be able to
+compare two cutpoint methods on the same outcome,
+or compare two outcomes via the same method.
+
+I do not know whether this could be modified in a way to
+allow for outcomes like cognition, that include up-down
+covariates and individual adjustments.
+
+# More thoughts on initial values with brm meanfield
+
+Using brm() to get initial values hasn't been quite
+as smooth as it initially was. 
+
+Here are a few conclusions and/or suggestions:
+
+ - For PET outcomes in BRM models using algorithm 'meanfield',
+it seems that using default priors plus more iterations out performed
+my attempt to use informative priors.
+ - Default prior plus increased iterations may be preferable for new outcomes, or cohorts having subjects with singletons.
+ - Informative priors may speed up runtime, but fail more easily too.  
+Specifying priors can cause issues as the mean curve changes
+with the sample thus very-informative priors might work for one 
+subsample but not another.
+ - Try update() to avoid recompiling.
+
+Example of update() and default priors:  
+  e.g. short.fit <- brm(data, iter=100, seed = xx, algorithm='meanfield')  
+  e.g. long.fit <- update(short.fit, <newdata=moredata>, iter=30000)  
+And so on.  
+
+So, which set of initials is better from these two typse of models?
+
+  1) model with steeper slopes, but not initial alpha for all ppts
+  2) model with all alphas but less steep slopes
+
+I don't know how I would answer this question definitively
+
+
+# Initial values using brm model on cognition
+
+**Question:** Cognition models have a harder time reaching convergence. 
+What impacts convergence the most: specifying priors vs amount of data?
+
+**Answer:** Specifying a modicum of prior information improves convergence
+of cognition models.
+
+**Caveats:** Tested with MCMC models, not VI models.  
+
+Fit 9 MCMC models on AVLT sum (5+6+d) in the MCSA subjects.  
+Each model varied by priors and/or data.
+
+ - Priors
+   - default uninformative
+   - user-specific priors on Bs
+   - user-specified priors on almost everything
+ - Data: subjects having at least X AVLT scores
+   - 10+ 
+   - 6+ 
+   - 2+ 
+
+![](9-mcmc-models-on-avlt-sum.png)
+
+The overall shape varies by the data.
+
+The convergence of the model (R-hats) varies by priors. 
+The default prior performed terribly – it never converged in my tests. 
+A minimum amount of user-specified prior was critical to get a decent
+model (e.g. specifying priors on Bs).  Specifying priors on nearly all
+parameters had the best convergence, however with new data this may
+not be a great option if too constrained.  So, if
+I want to get decent initial alpha values, then using a modicum of prior
+information on the Bs is important.
+
+**Question**: If I use informative priors, do the VI models do OK?
+
+**Answer**: Not for cognition
+
+![](4-vi-models-on-avlt-sum.png)
+
+Only the one model reached a shape that made sense.  VI models don't 
+produce meaningful R-hats so we can't check 'convergence'.
+The random effect standard deviation was OK in this model.
+
+In conclusions, variational inference models that include two random effects: 
+
+ - fail with less-informative subjects (e.g. 2+ fails more easily than 10+)
+ - fail with too few *or* too many user-specified priors 
+ - require more iterations vs PET or plasma outcomes
+ 
+Perhaps if you have the time to fiddle with it, we
+could get a reasonable model.  However, it seems like going 
+straight to MCMC is the most efficient approach for cognition or other
+outcomes like it with 2 types of random effects.
+
+If we want to get initial values from a model that works and
+don't have time to 'fiddle' with it,
+then use MCMC on cognition for initial values with at least 
+a modicum of user-specified prior information,
+and subjects having 2+ measures.
+
+# Relative reproducibility
+
+With the NLME method, we observed
+some outcomes were better suited than others. 
+Less noisy outcomes converge to the same solution consistently,
+middling noisy outcomes would converge but not always to the same solution
+and some parameters would have large CIs. Care must be taken
+to include these outcomes (e.g. additional constraints may be needed.)
+Other outcomes were so noisy that were not well suited for
+modeling with the NLME method.
+
+Investigate the relative signal to noise for each outcome. 
+
+Start by visually assessing trajectories for each of the outcomes.
+The purpose is to evaluate noise, and if there seems to be non-linearity over time.
+
+There is a variation of these trajectory plots above, but only on a random sample 
+of subjects having longer follow-ups.  We may want to also review all trajectories
+among those have 3+ values.
+
+```{r all-trajectories, fig.width=8.25, fig.height=2.5}
+pdat <- d %>%
+  mutate(y.unscaled = case_when(
+    npib < 3 & outcome == 'amyloid' ~ NA,
+    ntau < 3 & outcome == 'tau' ~ NA,
+    nwmh < 3 & outcome == 'wmh' ~ NA,
+    TRUE ~ y.unscaled))
+
+pdat %>%
+  pfun2(., mapping=aes(x=age, y=y.unscaled)) +
+  geom_point(size=0.2, aes(color=color)) +
+  facet_wrap(~outcome, scales='free_y', ncol=3)
+```
+
+Next, fit a separate line to each subject with 3+ values, and
+tally up the deviation of each subject about that fitted line.
+This is one estimate of the reproducibility of the outcome.
+If a subject has a longer series and they are rising on a curve, then this
+approach will overestimate the error somewhat; but the plots we have so far
+look pretty linear.
+
+
+```{r, linear1}
+fitlines <- function(id, time, y, howmany=4) {
+#    cat("fitline ")   # it was so slow I thought it was broken
+    keep1 <- !(is.na(time) | is.na(y))
+    count <- table(id[keep1])
+    uid <- names(count)[count >= howmany]
+    nid <- length(uid)
+    fits <- matrix(0, nid, 5)
+    for (i in 1:nid) {
+        tfit <- lm(y ~ time, subset= (id== uid[i]))
+        sfit <- summary(tfit)
+        fits[i,] <- c(coef(sfit)[c(1,2,4)], mean(predict(tfit)), sfit$sigma)
+    }
+    colnames(fits) <- c('intercept', 'slope', 'se(slope)', 'ybar', 'rss')
+    list(fits=fits, id= uid, n= count[count >= howmany], count=table(count))
+}
+
+# this takes a long time to run, don't repeat when debugging
+if (!exists("ds")) {
+ds <- list(pib  = with(filter(d, outcome=='amyloid'), fitlines(id, age, y.unscaled)),
+           lpib = with(filter(d, outcome=='amyloid'), fitlines(id, age, log(y.unscaled))),
+           tau  = with(filter(d, outcome=='tau'),     fitlines(id, age, y.unscaled)),
+           ltau = with(filter(d, outcome=='tau'),     fitlines(id, age, log(y.unscaled))),
+           wmh  = with(filter(d, outcome=='wmh'),     fitlines(id, age, y.unscaled, 3)),
+           sqrtwmh = with(filter(d, outcome=='wmh'),     fitlines(id, age, sqrt(y.unscaled), 3))
+)}
+
+```
+
+```{r summary1}
+cvs <- sapply(ds, function(x) {
+    z <- x$fit
+    quantile(z[,"rss"], c(.2, .5, .8))/ diff(quantile(z[,"ybar"], c(.25,.75)))
+})
+
+pdat <- t(cvs) %>%
+  as.data.frame() %>%
+  rownames_to_column('outcome') %>%
+  mutate(gp1 = c(rep('PET',4),rep('MRI',2)),
+         gp1 = factor(gp1, unique(gp1)))
+
+pdat %>%
+ggplot(., aes(x=`50%`,y=outcome,group=gp1)) +
+  geom_point() +
+  geom_segment(aes(x=`20%`, xend=`80%`,y=outcome,yend=outcome)) +
+  geom_vline(xintercept=c(0.1,0.25,0.5),col='gray50',lty=2) +
+  facet_wrap(~gp1, ncol=1, strip.position = 'left', scales = 'free_y') +
+  xlim(0,1) +
+  labs(x = "(.2, .5, .8 quantiles of sd)/ IQR",
+       y = '') +
+  theme(strip.placement='outside') 
+```
+
+For the three outcomes we are including in these analyses, it appears that we should be OK. 
+The relative reproducibility is reasonable.
+
+Example figure legend: 
+Longitudinal variability in measures quantified as the intra vs inter 
+individual variability over serial measurements for a subset of MCSA
+participants. Each measure is scaled by the IQR. The value indicates 
+how reliably we could determine if a given individual moved from the 
+25th to the 75th percentile of the response, i.e., how well we could 
+detect if someone progressed.
+
